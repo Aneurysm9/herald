@@ -36,11 +36,11 @@ commit_parsers = [
   { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
   { message = "^perf", group = "<!-- 2 -->Performance" },
   { message = "^refactor", group = "<!-- 3 -->Refactoring" },
-  { message = "^doc", group = "<!-- 4 -->Documentation" },
-  { message = "^test", group = "<!-- 5 -->Testing" },
-  { message = "^ci", group = "<!-- 6 -->CI/CD" },
-  { message = "^chore\\(release\\)", skip = true },
-  { message = "^chore|^style|^build", group = "<!-- 7 -->Miscellaneous" },
+  { message = "^doc", skip = true },
+  { message = "^test", skip = true },
+  { message = "^ci", skip = true },
+  { message = "^chore", skip = true },
+  { message = "^style|^build", skip = true },
 ]
 
 [remote.github]
