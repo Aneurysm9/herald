@@ -1,5 +1,10 @@
 # Herald
 
+[![CI](https://github.com/Aneurysm9/herald/actions/workflows/ci.yml/badge.svg)](https://github.com/Aneurysm9/herald/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/Aneurysm9/herald)](https://github.com/Aneurysm9/herald/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](Cargo.toml)
+
 **DNS control plane for multi-provider record management**
 
 Managing DNS records across multiple providers and zones is tedious and error-prone. Records drift, manual changes get lost, and coordinating updates across Cloudflare, internal DNS servers, and ACME challenges means juggling multiple APIs and credentials. Herald solves this by providing a single reconciliation loop that takes a declared desired state and converges it across any number of backends — safely, repeatedly, and automatically.
