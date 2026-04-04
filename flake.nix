@@ -47,16 +47,15 @@
           pkg-config
         ];
 
-        buildInputs =
-          with pkgs;
-            [
-              openssl
-            ]
-            ++ lib.optionals pkgs.stdenv.isDarwin [
-              pkgs.libiconv
-              pkgs.darwin.apple_sdk.frameworks.Security
-              pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
-            ];
+        buildInputs = with pkgs;
+          [
+            openssl
+          ]
+          ++ lib.optionals pkgs.stdenv.isDarwin [
+            pkgs.libiconv
+            pkgs.darwin.apple_sdk.frameworks.Security
+            pkgs.darwin.apple_sdk.frameworks.SystemConfiguration
+          ];
       };
 
       # Build just the cargo dependencies for caching
@@ -69,11 +68,28 @@
         });
 
       # Static musl build for deployment
-      heraldStatic = craneLib.buildPackage (commonArgs
+      muslCc = pkgs.pkgsCross.musl64.stdenv.cc;
+
+      staticArgs = {
+        inherit src;
+        strictDeps = true;
+
+        CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
+        CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+
+        # musl C compiler for bundled C dependencies (SQLite)
+        nativeBuildInputs = [pkgs.pkg-config muslCc];
+        buildInputs = [];
+
+        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${muslCc}/bin/x86_64-unknown-linux-musl-cc";
+        CC_x86_64_unknown_linux_musl = "${muslCc}/bin/x86_64-unknown-linux-musl-cc";
+      };
+
+      staticCargoArtifacts = craneLib.buildDepsOnly staticArgs;
+
+      heraldStatic = craneLib.buildPackage (staticArgs
         // {
-          inherit cargoArtifacts;
-          CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
-          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+          cargoArtifacts = staticCargoArtifacts;
         });
     in {
       checks = {
