@@ -94,7 +94,12 @@
         };
         depsOnly = craneLib.buildDepsOnly args;
       in
-        craneLib.buildPackage (args // {cargoArtifacts = depsOnly;});
+        craneLib.buildPackage (args
+          // {
+            cargoArtifacts = depsOnly;
+            # Skip tests for cross-compiled binaries (can't run on build host)
+            doCheck = false;
+          });
 
       heraldStatic = mkStatic {
         target = "x86_64-unknown-linux-musl";
