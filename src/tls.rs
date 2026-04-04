@@ -1,10 +1,9 @@
-use std::io::BufReader;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 
 use crate::config::TlsConfig;
 
@@ -14,12 +13,8 @@ use crate::config::TlsConfig;
 /// by any intermediates). The key file should contain a single PKCS#8 or RSA
 /// private key in PEM format.
 pub(crate) fn load_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
-    let cert_bytes = std::fs::read(&config.cert_file)
-        .with_context(|| format!("reading TLS cert file: {}", config.cert_file))?;
-    let key_bytes = std::fs::read(&config.key_file)
-        .with_context(|| format!("reading TLS key file: {}", config.key_file))?;
-
-    let certs: Vec<_> = rustls_pemfile::certs(&mut BufReader::new(cert_bytes.as_slice()))
+    let certs: Vec<_> = CertificateDer::pem_file_iter(&config.cert_file)
+        .with_context(|| format!("reading TLS cert file: {}", config.cert_file))?
         .collect::<Result<_, _>>()
         .context("parsing PEM certificate chain")?;
 
@@ -29,9 +24,8 @@ pub(crate) fn load_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
         config.cert_file
     );
 
-    let key: PrivateKeyDer = rustls_pemfile::private_key(&mut BufReader::new(key_bytes.as_slice()))
-        .context("parsing PEM private key")?
-        .context("no private key found in key file")?;
+    let key: PrivateKeyDer = PrivateKeyDer::from_pem_file(&config.key_file)
+        .with_context(|| format!("reading TLS key file: {}", config.key_file))?;
 
     let server_config = ServerConfig::builder_with_provider(Arc::new(
         tokio_rustls::rustls::crypto::ring::default_provider(),
