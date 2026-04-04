@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.1.2] — 2026-04-04
+
+### Bug Fixes
+
+- Skip tests for cross-compiled static binaries([d362e9f](https://github.com/Aneurysm9/herald/commit/d362e9f21407ec237d896de8f52924cb99587ef2))
+
 ## [0.1.1] — 2026-04-04
 
 ### Features
