@@ -139,6 +139,7 @@
 
         packages = with pkgs; [
           alejandra
+          cargo-audit
           cargo-watch
           cargo-edit
         ];
