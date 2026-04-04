@@ -1,0 +1,48 @@
+[changelog]
+header = """
+# Changelog\n
+"""
+body = """
+{%- macro remote_url() -%}
+  https://github.com/{{ remote.github.owner }}/{{ remote.github.repo }}
+{%- endmacro -%}
+
+{% if version -%}
+  ## [{{ version | trim_start_matches(pat="v") }}]\
+    {%- if version %} — {{ timestamp | date(format="%Y-%m-%d") }}{% endif %}
+{% else -%}
+  ## [Unreleased]
+{% endif -%}
+
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+  {% for commit in commits %}
+  - {{ commit.message | upper_first | split(pat="\n") | first | trim }}\
+    ([{{ commit.id | truncate(length=7, end="") }}]({{ self::remote_url() }}/commit/{{ commit.id }}))\
+    {%- if commit.breaking %} **BREAKING**{% endif %}
+  {% endfor %}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+filter_unconventional = true
+split_commits = false
+tag_pattern = "v[0-9].*"
+sort_commits = "newest"
+commit_parsers = [
+  { message = "^feat", group = "<!-- 0 -->Features" },
+  { message = "^fix", group = "<!-- 1 -->Bug Fixes" },
+  { message = "^perf", group = "<!-- 2 -->Performance" },
+  { message = "^refactor", group = "<!-- 3 -->Refactoring" },
+  { message = "^doc", group = "<!-- 4 -->Documentation" },
+  { message = "^test", group = "<!-- 5 -->Testing" },
+  { message = "^ci", group = "<!-- 6 -->CI/CD" },
+  { message = "^chore\\(release\\)", skip = true },
+  { message = "^chore|^style|^build", group = "<!-- 7 -->Miscellaneous" },
+]
+
+[remote.github]
+owner = "Aneurysm9"
+repo = "herald"

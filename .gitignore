@@ -1,0 +1,8 @@
+/target
+/result
+*.swp
+*.swo
+*~
+.direnv/
+.envrc.local
+.claude/
