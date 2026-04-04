@@ -30,7 +30,10 @@
 
       rustToolchain = pkgs.rust-bin.stable.latest.default.override {
         extensions = ["rust-src" "rust-analyzer"];
-        targets = ["x86_64-unknown-linux-musl"];
+        targets = [
+          "x86_64-unknown-linux-musl"
+          "aarch64-unknown-linux-musl"
+        ];
       };
 
       craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -67,30 +70,41 @@
           inherit cargoArtifacts;
         });
 
-      # Static musl build for deployment
-      muslCc = pkgs.pkgsCross.musl64.stdenv.cc;
+      # Static musl builds for deployment
+      mkStatic = {
+        target,
+        crossPkgs,
+      }: let
+        cc = crossPkgs.stdenv.cc;
+        ccPrefix = crossPkgs.stdenv.cc.targetPrefix;
+        # cc-rs and cargo use underscores in env var names for target triples
+        targetUnder = builtins.replaceStrings ["-"] ["_"] target;
+        args = {
+          inherit src;
+          strictDeps = true;
 
-      staticArgs = {
-        inherit src;
-        strictDeps = true;
+          CARGO_BUILD_TARGET = target;
+          CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
 
-        CARGO_BUILD_TARGET = "x86_64-unknown-linux-musl";
-        CARGO_BUILD_RUSTFLAGS = "-C target-feature=+crt-static";
+          nativeBuildInputs = [pkgs.pkg-config cc];
+          buildInputs = [];
 
-        # musl C compiler for bundled C dependencies (SQLite)
-        nativeBuildInputs = [pkgs.pkg-config muslCc];
-        buildInputs = [];
+          "CARGO_TARGET_${pkgs.lib.toUpper targetUnder}_LINKER" = "${cc}/bin/${ccPrefix}cc";
+          "CC_${targetUnder}" = "${cc}/bin/${ccPrefix}cc";
+        };
+        depsOnly = craneLib.buildDepsOnly args;
+      in
+        craneLib.buildPackage (args // {cargoArtifacts = depsOnly;});
 
-        CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${muslCc}/bin/x86_64-unknown-linux-musl-cc";
-        CC_x86_64_unknown_linux_musl = "${muslCc}/bin/x86_64-unknown-linux-musl-cc";
+      heraldStatic = mkStatic {
+        target = "x86_64-unknown-linux-musl";
+        crossPkgs = pkgs.pkgsCross.musl64;
       };
 
-      staticCargoArtifacts = craneLib.buildDepsOnly staticArgs;
-
-      heraldStatic = craneLib.buildPackage (staticArgs
-        // {
-          cargoArtifacts = staticCargoArtifacts;
-        });
+      heraldStaticAarch64 = mkStatic {
+        target = "aarch64-unknown-linux-musl";
+        crossPkgs = pkgs.pkgsCross.aarch64-multiplatform-musl;
+      };
     in {
       checks = {
         inherit herald;
@@ -108,7 +122,7 @@
 
       packages = {
         default = herald;
-        inherit herald heraldStatic;
+        inherit herald heraldStatic heraldStaticAarch64;
       };
 
       apps.default = flake-utils.lib.mkApp {
