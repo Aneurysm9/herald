@@ -110,6 +110,31 @@
         target = "aarch64-unknown-linux-musl";
         crossPkgs = pkgs.pkgsCross.aarch64-multiplatform-musl;
       };
+
+      # Pre-built binaries fetched from GitHub Releases
+      releaseInfo = builtins.fromJSON (builtins.readFile ./nix/release.json);
+
+      heraldFromRelease =
+        if builtins.hasAttr system releaseInfo.binaries
+        then
+          pkgs.stdenv.mkDerivation {
+            pname = "herald";
+            version = releaseInfo.version;
+            src = pkgs.fetchurl releaseInfo.binaries.${system};
+            dontUnpack = true;
+            dontBuild = true;
+            installPhase = ''
+              install -Dm755 $src $out/bin/herald
+            '';
+            meta = with pkgs.lib; {
+              description = "Herald DNS control plane";
+              homepage = "https://github.com/Aneurysm9/herald";
+              license = licenses.mit;
+              mainProgram = "herald";
+              platforms = ["x86_64-linux" "aarch64-linux"];
+            };
+          }
+        else throw "herald release binary not available for ${system}";
     in {
       checks = {
         inherit herald;
@@ -125,10 +150,14 @@
         };
       };
 
-      packages = {
-        default = herald;
-        inherit herald heraldStatic heraldStaticAarch64;
-      };
+      packages =
+        {
+          default = herald;
+          inherit herald heraldStatic heraldStaticAarch64;
+        }
+        // pkgs.lib.optionalAttrs (builtins.hasAttr system releaseInfo.binaries) {
+          inherit heraldFromRelease;
+        };
 
       apps.default = flake-utils.lib.mkApp {
         drv = herald;

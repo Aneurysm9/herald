@@ -1,0 +1,50 @@
+name: Update release hashes
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  update-hashes:
+    name: Update nix/release.json
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
+      - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v13
+      - name: Update release hashes
+        env:
+          VERSION: ${{ github.event.release.tag_name }}
+        run: |
+          VERSION_STRIPPED="${VERSION#v}"
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${VERSION}"
+          X86_URL="${BASE_URL}/herald-linux-x86_64"
+          AARCH64_URL="${BASE_URL}/herald-linux-aarch64"
+
+          X86_HASH=$(nix store prefetch-file --json "${X86_URL}" | jq -r '.hash')
+          AARCH64_HASH=$(nix store prefetch-file --json "${AARCH64_URL}" | jq -r '.hash')
+
+          jq -n \
+            --arg version "${VERSION_STRIPPED}" \
+            --arg x86_url "${X86_URL}" \
+            --arg x86_hash "${X86_HASH}" \
+            --arg aarch64_url "${AARCH64_URL}" \
+            --arg aarch64_hash "${AARCH64_HASH}" \
+            '{
+              version: $version,
+              binaries: {
+                "x86_64-linux": {url: $x86_url, hash: $x86_hash},
+                "aarch64-linux": {url: $aarch64_url, hash: $aarch64_hash}
+              }
+            }' > nix/release.json
+
+      - name: Commit and push
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add nix/release.json
+          git commit -m "chore: update release hashes for ${{ github.event.release.tag_name }}"
+          git push
