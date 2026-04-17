@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.2.0] — 2026-04-17
+
+### Features
+
+- Add RFC 2136 DNS UPDATE support via hickory-dns([beb476f](https://github.com/Aneurysm9/herald/commit/beb476fa5e9b7269d243832d5ef82468b5735cb6))
+
+- Expose pre-built release binaries as flake packages([e539c21](https://github.com/Aneurysm9/herald/commit/e539c216fc5945a527760f643b09a841366031be))
+
+
+### Bug Fixes
+
+- Replace .expect() with error propagation in provider init([50c1a11](https://github.com/Aneurysm9/herald/commit/50c1a1141eee5cf0303652a890f29ec39d366c08))
+
+- Use system CA roots for TLS instead of bundled Mozilla roots([6435be7](https://github.com/Aneurysm9/herald/commit/6435be7f1eb14d004e88a6bdc10f7321dcf81d35))
+
 ## [0.1.3] — 2026-04-04
 
 ### Bug Fixes
