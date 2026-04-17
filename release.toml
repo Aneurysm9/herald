@@ -5,3 +5,4 @@ tag-message = "Herald v{{version}}"
 tag-prefix = "v"
 sign-commit = true
 sign-tag = true
+publish = false
