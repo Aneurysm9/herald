@@ -200,17 +200,19 @@ async fn init_providers(config: &Config, metrics: Metrics) -> Result<Initialized
         all.push(p);
     }
 
-    let acme = config.providers.acme.as_ref().map(|acme_config| {
+    let acme = if let Some(ref acme_config) = config.providers.acme {
         let storage_path = Some(std::path::PathBuf::from(&config.state_dir).join("acme.db"));
 
         let p = Arc::new(
             AcmeProvider::new(acme_config.clone(), storage_path, metrics.clone())
-                .expect("failed to initialize ACME provider"),
+                .context("initializing ACME provider")?,
         );
         tracing::info!("acme provider loaded");
         all.push(Arc::clone(&p) as Arc<dyn Provider>);
-        p
-    });
+        Some(p)
+    } else {
+        None
+    };
 
     let mirror = if let Some(ref mirror_config) = config.providers.mirror {
         let p = Arc::new(MirrorProvider::new(mirror_config.clone(), metrics.clone()).await?);
@@ -221,17 +223,19 @@ async fn init_providers(config: &Config, metrics: Metrics) -> Result<Initialized
         None
     };
 
-    let dynamic = config.providers.dynamic.as_ref().map(|dynamic_config| {
+    let dynamic = if let Some(ref dynamic_config) = config.providers.dynamic {
         let storage_path = Some(std::path::PathBuf::from(&config.state_dir).join("dynamic.db"));
 
         let p = Arc::new(
             DynamicProvider::new(dynamic_config.clone(), storage_path, metrics.clone())
-                .expect("failed to initialize dynamic DNS provider"),
+                .context("initializing dynamic DNS provider")?,
         );
         tracing::info!("dynamic provider loaded");
         all.push(Arc::clone(&p) as Arc<dyn Provider>);
-        p
-    });
+        Some(p)
+    } else {
+        None
+    };
 
     if all.is_empty() {
         tracing::warn!("no providers configured — reconciliation will produce no records");
@@ -382,7 +386,7 @@ async fn run_service(
                 .providers
                 .mirror
                 .as_ref()
-                .expect("mirror_provider is Some so mirror config must exist")
+                .context("mirror config missing despite mirror provider being initialized")?
                 .interval,
         )
         .context("invalid mirror interval")?;
