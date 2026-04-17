@@ -1,8 +1,9 @@
 name: Update release hashes
 
 on:
-  release:
-    types: [published]
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 permissions:
   contents: write
@@ -10,14 +11,23 @@ permissions:
 jobs:
   update-hashes:
     name: Update nix/release.json
+    # Only run if the Release workflow succeeded
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: DeterminateSystems/nix-installer-action@ef8a148080ab6020fd15196c2084a2eea5ff2d25 # v22
       - uses: DeterminateSystems/magic-nix-cache-action@565684385bcd71bad329742eefe8d12f2e765b39 # v13
+      - name: Get release tag
+        id: tag
+        env:
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          # workflow_run.head_branch contains the tag name for tag-triggered workflows
+          echo "tag=$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
       - name: Update release hashes
         env:
-          VERSION: ${{ github.event.release.tag_name }}
+          VERSION: ${{ steps.tag.outputs.tag }}
         run: |
           VERSION_STRIPPED="${VERSION#v}"
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/${VERSION}"
@@ -46,5 +56,5 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add nix/release.json
-          git commit -m "chore: update release hashes for ${{ github.event.release.tag_name }}"
+          git commit -m "chore: update release hashes for ${VERSION}"
           git push
