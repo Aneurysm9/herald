@@ -680,6 +680,184 @@ providers:
 
 The client can now set records in either zone, but only for domains matching the allowed patterns.
 
+## RFC 2136 Backend
+
+Herald can manage DNS records on any RFC 2136-compatible authoritative DNS server (BIND, Knot, PowerDNS) by sending DNS UPDATE messages. Unlike the Cloudflare and Technitium backends, RFC 2136 has no native comment/tag field, so Herald tracks managed records in a local SQLite database.
+
+### Key characteristics
+
+- **Managed record tracking**: Herald only touches records it created. Pre-existing records in the zone are invisible to the reconciler and will never be modified or deleted.
+- **TSIG authentication**: All DNS UPDATE messages can be signed with TSIG (RFC 2845/8945). HMAC-SHA256 is the default; the full RFC 8945 algorithm set is supported via hickory-dns. Without a TSIG key, updates are sent unsigned — only use this on trusted networks with server-side IP ACLs.
+- **TCP transport**: All DNS UPDATE messages are sent over TCP.
+- **State database**: Stored at `{state_dir}/rfc2136-{name}.db` — back this up along with your config.
+
+### Configuration
+
+```yaml
+backends:
+  rfc2136:
+    - name: "bind-internal"          # optional; defaults to "rfc2136-{index}"
+      zones:
+        - "internal.example.com"
+      primary_nameserver: "ns1.internal.example.com:53"  # port defaults to 53 if omitted
+      tsig_key_file: "/run/secrets/herald_tsig_key"      # base64 HMAC-SHA256 secret
+      tsig_key_name: "herald.internal.example.com"       # key name as used in nsupdate/BIND config
+```
+
+### TSIG key setup (BIND)
+
+```bash
+# Generate a TSIG key
+tsig-keygen -a hmac-sha256 herald.internal.example.com > /etc/bind/herald.key
+
+# Add to named.conf
+key "herald.internal.example.com" {
+    algorithm hmac-sha256;
+    secret "<base64-secret-from-tsig-keygen>";
+};
+
+# Allow updates from Herald
+zone "internal.example.com" {
+    type master;
+    file "internal.example.com.zone";
+    allow-update { key herald.internal.example.com; };
+};
+```
+
+Extract the secret for Herald's `tsig_key_file`:
+```bash
+grep secret /etc/bind/herald.key | awk -F'"' '{print $2}' > /run/secrets/herald_tsig_key
+```
+
+### Firewall requirements
+
+Herald connects outbound to the primary nameserver on TCP port 53 (or the configured port). Ensure:
+- Herald host can reach the nameserver on TCP/53
+- The nameserver's ACL allows updates from Herald's IP
+
+### Mirror source (AXFR zone transfer)
+
+The RFC 2136 mirror source type uses AXFR zone transfer to enumerate all records in a zone, without requiring API access:
+
+```yaml
+providers:
+  mirror:
+    source:
+      type: rfc2136
+      zone: "internal.example.com"
+      nameserver: "ns1.internal.example.com:53"
+      tsig_key_file: "/run/secrets/axfr_key"    # optional TSIG for AXFR authentication
+      tsig_key_name: "axfr.internal.example.com"
+    rules:
+      - match:
+          type: AAAA
+        transform:
+          suffix: "example.org"
+```
+
+AXFR requires that the authoritative server permits zone transfers from Herald's IP. In BIND:
+```
+zone "internal.example.com" {
+    allow-transfer { key axfr.internal.example.com; };  # or IP-based ACL
+};
+```
+
+## DNS UPDATE Receiver
+
+Herald can act as a DNS UPDATE target (RFC 2136 server), accepting `nsupdate`-compatible messages over UDP and TCP. Incoming records are stored in the dynamic provider and a reconciliation pass is triggered automatically.
+
+This provides an alternative transport to the HTTP API, useful for:
+- **OPNsense** — via its "Services > Dynamic DNS > RFC 2136" plugin
+- **nsupdate** — standard BIND utility for DNS updates
+- **Any RFC 2136-compatible client**
+
+### Prerequisites
+
+The DNS UPDATE receiver requires the dynamic provider to be configured. Incoming records are managed under the specified TSIG key's associated client name.
+
+### Configuration
+
+```yaml
+# Dynamic provider (must be configured)
+providers:
+  dynamic:
+    clients:
+      opnsense:
+        allowed_domains:
+          - "*.example.com"
+        allowed_zones:
+          - "example.com"
+
+# DNS UPDATE receiver
+dns_server:
+  listen: "[::]:5353"   # use 53 for standard DNS port (requires elevated privileges)
+  tsig_keys:
+    - key_name: "opnsense.example.com"     # TSIG key name in DNS messages
+      algorithm: "hmac-sha256"             # only supported algorithm
+      secret_file: "/run/secrets/tsig_opnsense"  # base64 HMAC-SHA256 secret
+      client: "opnsense"                   # must match a providers.dynamic.clients key
+```
+
+### TSIG key generation
+
+```bash
+# Generate a key for OPNsense
+tsig-keygen -a hmac-sha256 opnsense.example.com
+
+# Extract the base64 secret
+tsig-keygen -a hmac-sha256 opnsense.example.com | awk '/secret/ {gsub(/[";]/, "", $2); print $2}' \
+  > /run/secrets/tsig_opnsense
+```
+
+### OPNsense configuration (RFC 2136 plugin)
+
+In OPNsense: **Services > Dynamic DNS > RFC 2136 > Add**
+
+| Field       | Value                                         |
+|-------------|-----------------------------------------------|
+| Server      | `herald.example.com`                          |
+| Port        | `5353` (or your configured port)              |
+| Key name    | `opnsense.example.com` (must match `key_name`)|
+| Key         | base64 HMAC-SHA256 secret (from `secret_file`)|
+| Algorithm   | HMAC-SHA256                                   |
+| Zone        | `example.com`                                 |
+| Record      | `wan.example.com`                             |
+
+### nsupdate usage
+
+```bash
+# Create/update an A record
+nsupdate -y hmac-sha256:opnsense.example.com:<base64-secret> <<EOF
+server herald.example.com 5353
+update add wan.example.com 60 A 198.51.100.1
+send
+EOF
+
+# Delete a record
+nsupdate -y hmac-sha256:opnsense.example.com:<base64-secret> <<EOF
+server herald.example.com 5353
+update delete wan.example.com A
+send
+EOF
+```
+
+### Firewall requirements
+
+Open the DNS UPDATE port (UDP and TCP) to clients that need to send updates. Restrict to known client IPs where possible — TSIG provides cryptographic authentication, but defence in depth is valuable.
+
+### Permission model
+
+Incoming DNS UPDATE records are subject to the same permission scoping as the HTTP API:
+- The TSIG key's `client` must have `allowed_domains` matching the record name
+- The derived zone must be in `allowed_zones`
+- Only records in configured backend zones can be managed
+
+### Limitations
+
+- Prerequisite section (RFC 2136 §3.2) is parsed but not evaluated — updates always proceed if TSIG authentication succeeds
+- `TYPE=ANY` delete-all (delete all records for a name) is not yet implemented
+- Responses are not TSIG-signed
+
 ## Multi-Zone Setup
 
 Herald supports managing DNS records across multiple Cloudflare zones. This is useful for organizations managing multiple domains or environments.

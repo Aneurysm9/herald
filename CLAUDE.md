@@ -60,10 +60,14 @@ herald
 ├── Backends (where records are published)
 │   ├── cloudflare  — Cloudflare API, multi-zone support
 │   ├── technitium  — Technitium DNS Server HTTP API, multi-zone support
+│   ├── rfc2136     — RFC 2136 DNS UPDATE to any authoritative server (BIND, Knot, etc.)
 │   └── (future)    — Route53, PowerDNS, etc.
 │
 ├── Reconciler
 │   └── Periodically diffs desired state vs actual → creates/updates/deletes
+│
+├── DNS UPDATE server (optional)
+│   └── Receives nsupdate-compatible DNS UPDATE messages, feeds into dynamic provider
 │
 └── API server (axum)
     └── Authenticated endpoints for ACME challenges, DNS records, and management
@@ -115,9 +119,12 @@ src/
 ├── backend/
 │   ├── mod.rs         — Backend trait + Change type
 │   ├── cloudflare.rs  — Cloudflare API implementation (multi-zone support)
-│   └── technitium.rs  — Technitium DNS Server API implementation (multi-zone support)
+│   ├── technitium.rs  — Technitium DNS Server API implementation (multi-zone support)
+│   └── rfc2136.rs     — RFC 2136 DNS UPDATE backend (SQLite managed-record tracking)
 ├── reconciler/
 │   └── mod.rs         — Desired vs actual diff + change application
+├── dns_server.rs      — RFC 2136 DNS UPDATE receiver (nsupdate-compatible server)
+├── rfc2136_util.rs    — Herald ↔ hickory-dns adapter (RecordValue ↔ RData conversions, TSIG key loading)
 └── technitium_util.rs — Shared Technitium API types and utilities
 ```
 
@@ -159,6 +166,14 @@ backends:
       url: "http://ns01.internal.example.com:5380"
       token_file: "/run/secrets/herald_technitium_token"
 
+  rfc2136:
+    - name: "bind-internal"  # optional name for logging
+      zones:
+        - "internal.example.com"
+      primary_nameserver: "ns1.internal.example.com:53"  # :53 default if port omitted
+      tsig_key_file: "/run/secrets/herald_tsig_key"      # base64 HMAC-SHA256 secret
+      tsig_key_name: "herald.internal.example.com"       # key name in DNS messages
+
 # Providers — sources of desired records
 providers:
   # Static records from config
@@ -188,6 +203,13 @@ providers:
       # subdomains:  # optional: explicit list of subdomains to query
       #   - "host1"
       #   - "host2"
+
+      # Option 3: AXFR zone transfer (RFC 2136-compatible authoritative server)
+      # type: rfc2136
+      # zone: "internal.example.com"
+      # nameserver: "ns1.internal.example.com:53"
+      # tsig_key_file: "/run/secrets/tsig_key"  # optional TSIG for AXFR auth
+      # tsig_key_name: "axfr.internal.example.com"
     rules:
       - match:
           type: AAAA             # only AAAA records
@@ -229,6 +251,15 @@ providers:
 reconciler:
   interval: "1m"
   dry_run: false
+
+# DNS UPDATE server (optional) — receives nsupdate/OPNsense DNS UPDATE messages
+dns_server:
+  listen: "[::]:5353"  # default port; use 53 if running as root/with CAP_NET_BIND_SERVICE
+  tsig_keys:
+    - key_name: "opnsense.example.com"  # TSIG key name as it appears in DNS messages
+      algorithm: "hmac-sha256"          # only supported algorithm
+      secret_file: "/run/secrets/tsig_opnsense"  # file containing base64 HMAC secret
+      client: "opnsense"               # must match a key in providers.dynamic.clients
 ```
 
 ## API Design
@@ -476,6 +507,63 @@ dns_herald_rm() {
 }
 ```
 
+## DNS UPDATE Server
+
+Herald can receive DNS UPDATE messages (RFC 2136) on a configurable address, providing an alternative to the HTTP API for clients like OPNsense (via its "RFC 2136 Dynamic DNS" plugin) or `nsupdate`.
+
+### Authentication
+
+All incoming DNS UPDATE messages must be signed with TSIG (RFC 2845/8945). HMAC-SHA256 is the default; hickory-dns supports the full RFC 8945 algorithm set. Each configured TSIG key maps to a dynamic provider client name; that client's `allowed_domains` and `allowed_zones` govern what records the key may manage.
+
+### TSIG key file format
+
+The `secret_file` for each TSIG key should contain a single base64-encoded HMAC-SHA256 secret (the raw key bytes encoded as base64, with or without trailing newline). This is the same format as `tsig-keygen` output with the secret extracted:
+
+```bash
+# Generate a key with tsig-keygen (BIND)
+tsig-keygen -a hmac-sha256 opnsense.example.com
+
+# Extract the secret for Herald's secret_file
+tsig-keygen -a hmac-sha256 opnsense.example.com | grep secret | awk -F'"' '{print $2}' > /run/secrets/tsig_opnsense
+```
+
+### RCODE semantics
+
+| Condition                          | RCODE          |
+|------------------------------------|----------------|
+| Success                            | 0 (NOERROR)    |
+| Unknown TSIG key / bad MAC         | 9 (NOTAUTH)    |
+| Domain or zone not permitted       | 5 (REFUSED)    |
+| Zone not found for FQDN            | 5 (REFUSED)    |
+| Malformed request                  | 1 (FORMERR)    |
+| Non-UPDATE opcode                  | 5 (REFUSED)    |
+
+### OPNsense configuration (RFC 2136 plugin)
+
+OPNsense's "Services > Dynamic DNS > RFC 2136" plugin can send DNS UPDATE messages directly to Herald:
+1. **Server**: `herald.example.com` (Herald's hostname)
+2. **Port**: `5353` (or whatever `dns_server.listen` specifies)
+3. **Key name**: must match `key_name` in Herald's `dns_server.tsig_keys`
+4. **Key**: base64 HMAC-SHA256 secret (same value as `secret_file`)
+5. **Algorithm**: `hmac-sha256`
+
+### nsupdate usage
+
+```bash
+nsupdate -k /path/to/tsig.key <<EOF
+server herald.example.com 5353
+update add wan.example.com 60 A 198.51.100.1
+send
+EOF
+```
+
+### Limitations
+
+- Prerequisite section (RFC 2136 §3.2) is parsed by hickory but not evaluated — updates always proceed if TSIG authentication succeeds
+- `TYPE=ANY` delete-all is parsed but not yet dispatched to the dynamic provider
+- Responses are not TSIG-signed (future work)
+- Zone section validation (ZOCOUNT=1, QTYPE=SOA, QCLASS=IN) is now enforced
+
 ## Cloudflare API Reference
 
 Herald targets the Cloudflare v4 API. Base URL: `https://api.cloudflare.com/client/v4`
@@ -654,11 +742,16 @@ Herald needs to distinguish records it manages from records created manually at 
 7. ✅ **Scheduling** — periodic reconciliation and mirror polling
 8. ✅ **Technitium backend** — Technitium DNS Server as a backend target (in addition to Cloudflare)
 9. ✅ **Persistence** — SQLite storage for dynamic DNS and ACME challenges
+10. ✅ **RFC 2136 backend** — DNS UPDATE to BIND/Knot/etc., SQLite managed-record tracking
+11. ✅ **RFC 2136 mirror source** — AXFR zone transfer as a mirror source type (`type: rfc2136`)
+12. ✅ **DNS UPDATE receiver** — nsupdate-compatible server, feeds into dynamic provider
 
 **Future:**
 - Metrics / observability — OpenTelemetry metrics are partially implemented, could expand
 - Additional backends — Route53, PowerDNS, etc.
 - Batch operations — Optimize API calls with batch creates/deletes
+- TSIG-signed responses in the DNS UPDATE receiver
+- RFC 2136 prerequisite section evaluation
 
 ## Code Style
 

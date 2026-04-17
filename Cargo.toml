@@ -41,7 +41,10 @@ serde_yaml = "0.9"
 figment = { version = "0.10", features = ["yaml", "env"] }
 
 # DNS
-hickory-resolver = "0.25"
+hickory-resolver = { version = "0.26", default-features = false, features = ["tokio", "system-config"] }
+hickory-proto = { version = "0.26", default-features = false, features = ["dnssec-ring"] }
+hickory-net = { version = "0.26", default-features = false, features = ["tokio", "dnssec-ring"] }
+hickory-server = { version = "0.26", default-features = false, features = ["dnssec-ring"] }
 
 # Logging / tracing
 tracing = "0.1"
@@ -57,6 +60,9 @@ sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"
 base64 = "0.22"
+
+# Async stream combinators (used for AXFR zone transfer streaming)
+futures-util = "0.3"
 
 # Human-readable duration parsing (e.g., "1m", "5m30s")
 humantime = "2"

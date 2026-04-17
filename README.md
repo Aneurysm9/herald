@@ -13,9 +13,11 @@ Managing DNS records across multiple providers and zones is tedious and error-pr
 
 - **Declarative static records** — define DNS records in a config file; Herald reconciles them to your backends
 - **ACME challenge proxy** — per-service scoped tokens for DNS-01 certificate validation, compatible with lego and acme.sh
-- **DNS mirroring** — poll internal DNS zones and mirror selected records to public DNS under different names
+- **DNS mirroring** — poll internal DNS zones (Technitium API, direct DNS queries, or AXFR zone transfer) and mirror selected records to public DNS under different names
 - **Dynamic DNS** — API-driven record management with fine-grained domain and zone permission scoping (DynDNS protocol compatible)
-- **Multi-backend support** — Cloudflare and Technitium DNS Server, with a trait-based design for adding more
+- **RFC 2136 backend** — send DNS UPDATE messages to any authoritative server (BIND, Knot, PowerDNS) with TSIG authentication
+- **DNS UPDATE receiver** — accept nsupdate-compatible DNS UPDATE messages as an alternative to the HTTP API (OPNsense compatible)
+- **Multi-backend support** — Cloudflare, Technitium DNS Server, and RFC 2136; trait-based design for adding more
 - **Safe reconciliation** — diffs desired vs actual state, tags managed records, never touches manually-created records
 
 ## Architecture
@@ -23,9 +25,12 @@ Managing DNS records across multiple providers and zones is tedious and error-pr
 ```
 Providers (sources of desired records)
   ├── static    — records from config file
-  ├── mirror    — poll a DNS source, transform names, filter types
+  ├── mirror    — poll a DNS source (Technitium/DNS/AXFR), transform names, filter types
   ├── acme      — ephemeral TXT records from API, per-client scoped
   └── dynamic   — API-driven records, per-client domain/zone scoped
+          ▲
+          │  DNS UPDATE server (optional)
+          │  nsupdate/OPNsense → dynamic provider
           │
           ▼
      Reconciler
@@ -34,7 +39,8 @@ Providers (sources of desired records)
           ▼
      Backends (where records are published)
   ├── cloudflare  — Cloudflare API, multi-zone support
-  └── technitium  — Technitium DNS Server HTTP API, multi-zone support
+  ├── technitium  — Technitium DNS Server HTTP API, multi-zone support
+  └── rfc2136     — DNS UPDATE to BIND/Knot/PowerDNS, SQLite managed-record tracking
 ```
 
 Each provider implements the `Provider` trait and contributes `Vec<DnsRecord>` to a unified desired-state set. The reconciler diffs this against actual state from the backends and converges. The process is safe to re-run and supports dry-run mode.

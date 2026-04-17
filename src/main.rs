@@ -37,8 +37,12 @@
 mod api;
 mod backend;
 mod config;
+mod dns_server;
 mod provider;
 mod reconciler;
+#[cfg(test)]
+mod rfc2136_test_helpers;
+mod rfc2136_util;
 mod storage;
 mod technitium_util;
 mod telemetry;
@@ -61,8 +65,10 @@ use tracing_subscriber::EnvFilter;
 use crate::api::{AppState, TokenIndex};
 use crate::backend::Backend;
 use crate::backend::cloudflare::CloudflareBackend;
+use crate::backend::rfc2136::Rfc2136Backend;
 use crate::backend::technitium::TechnitiumBackend;
 use crate::config::Config;
+use crate::dns_server::DnsServer;
 use crate::provider::Provider;
 use crate::provider::acme::AcmeProvider;
 use crate::provider::dynamic::DynamicProvider;
@@ -272,10 +278,25 @@ async fn init_backends(config: &Config, metrics: Metrics) -> Result<Vec<Arc<dyn 
         backends.push(backend);
     }
 
+    // Initialize RFC 2136 backends
+    for (idx, rfc_config) in config.backends.rfc2136.iter().enumerate() {
+        let backend = Arc::new(
+            Rfc2136Backend::new(rfc_config, idx, &config.state_dir, metrics.clone()).await?,
+        ) as Arc<dyn Backend>;
+
+        tracing::info!(
+            backend = %backend.name(),
+            zones = ?backend.zones(),
+            "rfc2136 backend initialized"
+        );
+
+        backends.push(backend);
+    }
+
     // Require at least one backend
     if backends.is_empty() {
         anyhow::bail!(
-            "no backends configured — at least one backend (cloudflare or technitium) is required"
+            "no backends configured — at least one backend (cloudflare, technitium, or rfc2136) is required"
         );
     }
 
@@ -310,6 +331,9 @@ async fn run_service(
 
     let reconcile_notify = Arc::new(Notify::new());
 
+    // Clone what we need before dynamic_provider is consumed by AppState.
+    let dynamic_for_dns = dynamic_provider.as_ref().map(Arc::clone);
+
     let state = Arc::new(AppState {
         acme_provider,
         dynamic_provider,
@@ -329,6 +353,23 @@ async fn run_service(
 
     tracing::info!(listen = %config.listen, "HTTPS server starting");
     tokio::spawn(serve_tls(listener, tls_acceptor, app));
+
+    // Spawn DNS UPDATE receiver if configured.
+    if let Some(ref dns_config) = config.dns_server {
+        let Some(dyn_provider) = dynamic_for_dns else {
+            anyhow::bail!("dns_server requires providers.dynamic to be configured");
+        };
+        let dns_server = DnsServer::new(
+            dns_config,
+            &dns_config.tsig_keys,
+            dyn_provider,
+            backends.clone(),
+            Arc::clone(&reconcile_notify),
+        )
+        .await?;
+        tokio::spawn(dns_server.run());
+        tracing::info!("DNS UPDATE receiver started");
+    }
 
     // Parse intervals
     let reconciler_interval =

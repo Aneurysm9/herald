@@ -1,11 +1,19 @@
 use super::{DesiredRecord, Named, Provider, RecordValue};
 use crate::config::MirrorProviderConfig;
-use crate::technitium_util::{TechnitiumResponse, extract_rdata};
+use crate::rfc2136_util::{self, TSIG_FUDGE};
+use crate::technitium_util::{TechnitiumResponse, extract_rdata as extract_technitium_rdata};
 use crate::telemetry::Metrics;
 use anyhow::{Context, Result};
-use hickory_resolver::{TokioResolver, name_server::TokioConnectionProvider};
+use hickory_net::client::{Client, ClientHandle};
+use hickory_net::runtime::TokioRuntimeProvider;
+use hickory_net::tcp::TcpClientStream;
+use hickory_net::xfer::DnsMultiplexer;
+use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
+use hickory_proto::rr::{Name, RecordType, TSigner};
+use hickory_resolver::TokioResolver;
 use opentelemetry::KeyValue;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,6 +29,10 @@ pub(crate) struct MirrorProvider {
     client: reqwest::Client,
     /// Pre-loaded API token for Technitium authentication
     technitium_token: Option<String>,
+    /// TSIG signer for RFC 2136 (AXFR) authentication
+    tsig_signer: Option<TSigner>,
+    /// Parsed nameserver address for RFC 2136 AXFR
+    rfc2136_nameserver: Option<SocketAddr>,
     /// DNS resolver for direct DNS queries
     resolver: TokioResolver,
     metrics: Metrics,
@@ -28,7 +40,11 @@ pub(crate) struct MirrorProvider {
 
 impl MirrorProvider {
     pub(crate) async fn new(config: MirrorProviderConfig, metrics: Metrics) -> Result<Self> {
-        // Validate configuration based on source type
+        // Validate configuration based on source type and prepare type-specific state.
+        let mut technitium_token: Option<String> = None;
+        let mut tsig_signer: Option<TSigner> = None;
+        let mut rfc2136_nameserver: Option<SocketAddr> = None;
+
         match config.source.r#type.as_str() {
             "technitium" => {
                 if config.source.url.is_none() {
@@ -36,6 +52,12 @@ impl MirrorProvider {
                 }
                 if config.source.token_file.is_none() {
                     anyhow::bail!("mirror source type 'technitium' requires 'token_file' field");
+                }
+                if let Some(ref path) = config.source.token_file {
+                    let token = tokio::fs::read_to_string(path)
+                        .await
+                        .with_context(|| format!("reading mirror token file: {path}"))?;
+                    technitium_token = Some(token.trim().to_string());
                 }
             }
             "dns" => {
@@ -46,32 +68,63 @@ impl MirrorProvider {
                     );
                 }
             }
+            "rfc2136" => {
+                let ns_str = config
+                    .source
+                    .nameserver
+                    .as_deref()
+                    .context("mirror source type 'rfc2136' requires 'nameserver' field")?;
+
+                // Add default port 53 if omitted.
+                let addr_str = if ns_str.contains(':') {
+                    ns_str.to_string()
+                } else {
+                    format!("{ns_str}:53")
+                };
+                rfc2136_nameserver =
+                    Some(addr_str.parse().with_context(|| {
+                        format!("parsing rfc2136 nameserver address: {addr_str}")
+                    })?);
+
+                if let (Some(path), Some(key_name)) =
+                    (&config.source.token_file, &config.source.tsig_key_name)
+                {
+                    let signer = rfc2136_util::load_tsigner_from_file(
+                        key_name,
+                        path,
+                        TsigAlgorithm::HmacSha256,
+                        TSIG_FUDGE,
+                    )
+                    .await?;
+                    tracing::info!(key_name = %key_name, "mirror TSIG key loaded");
+                    tsig_signer = Some(signer);
+                } else if config.source.token_file.is_some()
+                    || config.source.tsig_key_name.is_some()
+                {
+                    anyhow::bail!(
+                        "mirror rfc2136 source: both 'token_file' and 'tsig_key_name' are required for TSIG authentication"
+                    );
+                }
+            }
             other => {
                 anyhow::bail!("unknown mirror source type: {other}");
             }
         }
 
-        let technitium_token = if let Some(ref path) = config.source.token_file {
-            let token = tokio::fs::read_to_string(path)
-                .await
-                .with_context(|| format!("reading mirror token file: {path}"))?;
-            Some(token.trim().to_string())
-        } else {
-            None
-        };
-
         let client = reqwest::Client::new();
 
         // Initialize DNS resolver from system configuration
-        let resolver = TokioResolver::builder(TokioConnectionProvider::default())
+        let resolver = TokioResolver::builder_tokio()
             .context("initializing DNS resolver from system configuration")?
-            .build();
+            .build()?;
 
         Ok(Self {
             config,
             cached_records: Arc::new(RwLock::new(Vec::new())),
             client,
             technitium_token,
+            tsig_signer,
+            rfc2136_nameserver,
             resolver,
             metrics,
         })
@@ -110,6 +163,7 @@ impl MirrorProvider {
         let source_records = match self.config.source.r#type.as_str() {
             "technitium" => self.poll_technitium().await?,
             "dns" => self.poll_dns().await?,
+            "rfc2136" => self.poll_rfc2136().await?,
             other => anyhow::bail!("unknown mirror source type: {other}"),
         };
 
@@ -200,7 +254,7 @@ impl MirrorProvider {
 
         let mut records = Vec::new();
         for rec in body.response.records {
-            if let Some(value) = extract_rdata(&rec.r#type, &rec.r_data) {
+            if let Some(value) = extract_technitium_rdata(&rec.r#type, &rec.r_data) {
                 records.push(SourceRecord {
                     name: rec.name,
                     record_type: rec.r#type,
@@ -252,10 +306,10 @@ impl MirrorProvider {
         for record_type in query_types {
             match self.resolver.lookup(zone.as_str(), record_type).await {
                 Ok(lookup) => {
-                    for record in lookup.record_iter() {
+                    for record in lookup.answers() {
                         if let Some(value) = extract_dns_rdata(record) {
                             records.push(SourceRecord {
-                                name: record.name().to_utf8(),
+                                name: record.name.to_utf8(),
                                 record_type: record.record_type().to_string(),
                                 value,
                             });
@@ -282,10 +336,10 @@ impl MirrorProvider {
             for record_type in query_types {
                 match self.resolver.lookup(fqdn.as_str(), record_type).await {
                     Ok(lookup) => {
-                        for record in lookup.record_iter() {
+                        for record in lookup.answers() {
                             if let Some(value) = extract_dns_rdata(record) {
                                 records.push(SourceRecord {
-                                    name: record.name().to_utf8(),
+                                    name: record.name.to_utf8(),
                                     record_type: record.record_type().to_string(),
                                     value,
                                 });
@@ -306,6 +360,94 @@ impl MirrorProvider {
         }
 
         tracing::debug!(count = records.len(), zone = %zone, "fetched records via DNS");
+        Ok(records)
+    }
+
+    /// Poll records via AXFR zone transfer from an RFC 2136-compatible authoritative server.
+    ///
+    /// Connects over TCP, sends an AXFR query (optionally signed with TSIG), and reads
+    /// response messages until the second SOA record marks end-of-transfer.
+    /// SOA records are excluded from the returned set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection fails, the zone transfer is rejected,
+    /// or the response is malformed.
+    async fn poll_rfc2136(&self) -> Result<Vec<SourceRecord>> {
+        use futures_util::StreamExt;
+
+        let nameserver = self
+            .rfc2136_nameserver
+            .context("rfc2136 nameserver not initialized")?;
+        let zone = &self.config.source.zone;
+        let zone_name = Name::from_ascii(zone)
+            .with_context(|| format!("invalid zone name for AXFR: {zone}"))?;
+
+        let provider = TokioRuntimeProvider::default();
+        let (connect_future, handle) = TcpClientStream::new(
+            nameserver,
+            None,
+            Some(std::time::Duration::from_secs(30)),
+            provider,
+        );
+        let stream = connect_future
+            .await
+            .with_context(|| format!("connecting to nameserver {nameserver} for AXFR"))?;
+
+        let multiplexer =
+            DnsMultiplexer::new(stream, handle).with_timeout(std::time::Duration::from_secs(30));
+
+        let multiplexer = if let Some(ref signer) = self.tsig_signer {
+            multiplexer.with_signer(signer.clone())
+        } else {
+            multiplexer
+        };
+
+        let (mut client, bg) = Client::<TokioRuntimeProvider>::from_sender(multiplexer);
+        tokio::spawn(bg);
+
+        let mut xfr = client.zone_transfer(zone_name, None);
+
+        let mut records: Vec<SourceRecord> = Vec::new();
+        let mut soa_count = 0usize;
+
+        while let Some(response) = xfr.next().await {
+            let response = response.with_context(|| format!("AXFR response for {zone}"))?;
+
+            for record in &response.answers {
+                if record.record_type() == RecordType::SOA {
+                    soa_count += 1;
+                    if soa_count >= 2 {
+                        break;
+                    }
+                    continue;
+                }
+
+                let type_name = record.record_type().to_string();
+                match RecordValue::try_from(&record.data) {
+                    Ok(value) => {
+                        records.push(SourceRecord {
+                            name: record.name.to_utf8().trim_end_matches('.').to_string(),
+                            record_type: type_name,
+                            value: value.value_str().clone(),
+                        });
+                    }
+                    Err(_) => {
+                        tracing::debug!(
+                            name = %record.name,
+                            rtype = %record.record_type(),
+                            "skipping AXFR record with unsupported RDATA"
+                        );
+                    }
+                }
+            }
+
+            if soa_count >= 2 {
+                break;
+            }
+        }
+
+        tracing::debug!(count = records.len(), zone = %zone, "fetched records via AXFR");
         Ok(records)
     }
 
@@ -424,19 +566,17 @@ fn transform_name(name: &str, source_suffix: &str, new_suffix: &str) -> Option<S
 fn extract_dns_rdata(record: &hickory_resolver::proto::rr::Record) -> Option<String> {
     use hickory_resolver::proto::rr::RData;
 
-    match record.data() {
+    match &record.data {
         RData::A(addr) => Some(addr.to_string()),
         RData::AAAA(addr) => Some(addr.to_string()),
         RData::CNAME(cname) => Some(cname.to_utf8()),
-        RData::TXT(txt) => {
-            // TXT records can have multiple strings (as byte arrays), join them
-            Some(
-                txt.iter()
-                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
-                    .collect::<String>(),
-            )
-        }
-        RData::MX(mx) => Some(mx.exchange().to_utf8()),
+        RData::TXT(txt) => Some(
+            txt.txt_data
+                .iter()
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                .collect::<String>(),
+        ),
+        RData::MX(mx) => Some(mx.exchange.to_utf8()),
         _ => None,
     }
 }

@@ -275,8 +275,53 @@ impl DynamicProvider {
         Ok(())
     }
 
+    /// Delete all dynamic DNS records for a given name, regardless of type.
+    ///
+    /// Only records owned by the specified client are deleted. Records owned
+    /// by other clients are left untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client is unknown or not permitted for the
+    /// domain/zone.
+    pub(crate) async fn delete_all_for_name(
+        &self,
+        client: &str,
+        zone: &str,
+        name: &str,
+    ) -> Result<()> {
+        self.check_permission(client, zone, name)?;
+
+        let mut records = self.records.write().await;
+        let keys_to_delete: Vec<RecordKey> = records
+            .iter()
+            .filter(|(k, v)| k.zone == zone && k.name == name && v.client == client)
+            .map(|(k, _)| k.clone())
+            .collect();
+
+        for key in &keys_to_delete {
+            records.remove(key);
+        }
+        drop(records);
+
+        if let Some(ref storage) = self.storage {
+            for key in keys_to_delete {
+                let storage = Arc::clone(storage);
+                tokio::task::spawn_blocking(move || {
+                    let storage = storage.blocking_lock();
+                    storage.delete(&key)
+                })
+                .await
+                .context("database persistence task panicked")??;
+            }
+        }
+
+        tracing::info!(client, zone, name, "dynamic records deleted (all types)");
+        Ok(())
+    }
+
     /// Check that the client has permission for both the domain and the zone.
-    fn check_permission(&self, client: &str, zone: &str, name: &str) -> Result<()> {
+    pub(crate) fn check_permission(&self, client: &str, zone: &str, name: &str) -> Result<()> {
         let client_config = self
             .config
             .clients

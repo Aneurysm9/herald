@@ -59,6 +59,13 @@ pub(crate) struct Config {
     /// Directory for persistent state (`SQLite` databases for dynamic DNS and ACME challenges)
     #[serde(default = "default_state_dir")]
     pub state_dir: String,
+
+    /// DNS UPDATE server configuration (RFC 2136 receiver).
+    ///
+    /// When set, Herald starts a DNS UPDATE server on the specified address.
+    /// Requires `providers.dynamic` to be configured.
+    #[serde(default)]
+    pub dns_server: Option<DnsServerConfig>,
 }
 
 fn default_listen() -> String {
@@ -71,7 +78,7 @@ fn default_state_dir() -> String {
 
 /// Backend configuration.
 ///
-/// Backends are where DNS records are published. Supports Cloudflare and Technitium.
+/// Backends are where DNS records are published. Supports Cloudflare, Technitium, and RFC 2136.
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct BackendsConfig {
     /// Multiple Cloudflare backend instances. Each manages a distinct set of zones.
@@ -81,6 +88,10 @@ pub(crate) struct BackendsConfig {
     /// Multiple Technitium backend instances. Each manages a distinct set of zones.
     #[serde(default)]
     pub technitium: Vec<TechnitiumConfig>,
+
+    /// Multiple RFC 2136 backend instances. Each manages a distinct set of zones.
+    #[serde(default)]
+    pub rfc2136: Vec<Rfc2136BackendConfig>,
 }
 
 /// Cloudflare backend configuration.
@@ -118,6 +129,42 @@ pub(crate) struct TechnitiumConfig {
 
     /// Path to file containing the Technitium API token
     pub token_file: String,
+}
+
+/// RFC 2136 backend configuration.
+///
+/// Uses the DNS UPDATE protocol (RFC 2136) to manage records on any compatible
+/// authoritative DNS server (BIND, Knot, `PowerDNS`, etc.).
+///
+/// Managed records are tracked via a local `SQLite` database rather than a comment
+/// field (which RFC 2136 does not provide). Herald only manages records it
+/// created; pre-existing records in the zone are invisible to the reconciler.
+#[derive(Debug, Deserialize)]
+pub(crate) struct Rfc2136BackendConfig {
+    /// Optional name for logging (defaults to "rfc2136-{index}")
+    #[serde(default)]
+    pub name: Option<String>,
+
+    /// List of zone names this backend manages (e.g., `["internal.example.com"]`)
+    pub zones: Vec<String>,
+
+    /// Address of the primary (master) nameserver to send DNS UPDATE messages to.
+    ///
+    /// Format: `"host:port"` (e.g., `"ns1.internal.example.com:53"`).
+    pub primary_nameserver: String,
+
+    /// Path to file containing the base64-encoded TSIG secret.
+    ///
+    /// If omitted, UPDATE messages are sent unsigned. Only use unsigned updates
+    /// when the server is configured to allow updates from trusted IP ranges.
+    #[serde(default)]
+    pub tsig_key_file: Option<String>,
+
+    /// TSIG key name, as configured on the DNS server (e.g., `"herald.example.com."`).
+    ///
+    /// Required when `tsig_key_file` is set.
+    #[serde(default)]
+    pub tsig_key_name: Option<String>,
 }
 
 /// Provider configuration.
@@ -182,18 +229,19 @@ fn default_interval() -> String {
 
 /// Mirror source configuration.
 ///
-/// Specifies where to poll records from. Currently supports:
+/// Specifies where to poll records from. Supports:
 /// - `technitium`: Technitium DNS Server HTTP API (requires `url` and `token_file`)
 /// - `dns`: Direct DNS queries via resolver (optionally specify `subdomains` to query)
+/// - `rfc2136`: AXFR zone transfer from any RFC 2136-capable server (requires `nameserver`)
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct MirrorSource {
     pub r#type: String,
-    /// API URL (required for technitium, unused for dns)
+    /// API URL (required for technitium, unused for dns and rfc2136)
     #[serde(default)]
     pub url: Option<String>,
     /// Zone to query records from
     pub zone: String,
-    /// Path to API token file (required for technitium, unused for dns)
+    /// Path to API token file (required for technitium; optional TSIG secret for rfc2136)
     #[serde(default)]
     pub token_file: Option<String>,
     /// Explicit subdomain list to query (optional, for dns type only)
@@ -203,6 +251,14 @@ pub(crate) struct MirrorSource {
     /// will query `host1.zone` and `host2.zone`.
     #[serde(default)]
     pub subdomains: Vec<String>,
+    /// Nameserver address for AXFR (required for rfc2136, unused for other types).
+    ///
+    /// Format: `"host:port"` (e.g., `"ns1.internal.example.com:53"`).
+    #[serde(default)]
+    pub nameserver: Option<String>,
+    /// TSIG key name for AXFR authentication (optional, for rfc2136 type only).
+    #[serde(default)]
+    pub tsig_key_name: Option<String>,
 }
 
 /// A mirror transformation rule.
@@ -285,6 +341,57 @@ pub(crate) struct DynamicClientConfig {
     pub allowed_domains: Vec<String>,
     /// Zones this client is allowed to target
     pub allowed_zones: Vec<String>,
+}
+
+/// Configuration for the DNS UPDATE receiver (RFC 2136 server).
+///
+/// When configured, Herald listens for DNS UPDATE messages on UDP and TCP,
+/// validates TSIG authentication, and stores incoming records in the dynamic
+/// DNS provider. Requires `providers.dynamic` to be configured.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct DnsServerConfig {
+    /// Listen address for the DNS UPDATE server (UDP and TCP).
+    ///
+    /// Defaults to `"[::]:5353"`. Use port 53 only if Herald runs as root or
+    /// has `CAP_NET_BIND_SERVICE`.
+    #[serde(default = "default_dns_listen")]
+    pub listen: String,
+
+    /// TSIG keys accepted by the DNS UPDATE server.
+    ///
+    /// Each key maps to a dynamic provider client name, inheriting that
+    /// client's `allowed_domains` and `allowed_zones` permissions.
+    #[serde(default)]
+    pub tsig_keys: Vec<TsigKeyConfig>,
+}
+
+fn default_dns_listen() -> String {
+    "[::]:5353".to_string()
+}
+
+/// A TSIG key accepted by the DNS UPDATE receiver.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct TsigKeyConfig {
+    /// TSIG key name, as used in DNS UPDATE messages (e.g., `"opnsense.example.com."`).
+    pub key_name: String,
+
+    /// TSIG algorithm. Currently only `"hmac-sha256"` is supported.
+    #[serde(default = "default_tsig_algorithm")]
+    pub algorithm: String,
+
+    /// Path to file containing the base64-encoded TSIG secret.
+    pub secret_file: String,
+
+    /// Dynamic provider client name this key maps to.
+    ///
+    /// Must match a key in `providers.dynamic.clients`. The client's
+    /// `allowed_domains` and `allowed_zones` control which records this
+    /// key is permitted to manage.
+    pub client: String,
+}
+
+fn default_tsig_algorithm() -> String {
+    "hmac-sha256".to_string()
 }
 
 /// Reconciler configuration.
