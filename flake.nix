@@ -169,8 +169,10 @@
         packages = with pkgs; [
           alejandra
           cargo-audit
+          cargo-release
           cargo-watch
           cargo-edit
+          git-cliff
         ];
       };
 

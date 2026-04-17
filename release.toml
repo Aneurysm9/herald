@@ -1,8 +1,7 @@
-[workspace]
 pre-release-hook = ["git", "cliff", "--output", "CHANGELOG.md", "--tag", "{{version}}"]
 pre-release-commit-message = "chore(release): {{version}}"
 tag-message = "Herald v{{version}}"
-tag-prefix = "v"
+tag-prefix = ""
 sign-commit = true
 sign-tag = true
 publish = false
