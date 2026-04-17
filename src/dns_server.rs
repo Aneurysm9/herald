@@ -25,15 +25,18 @@ use crate::backend::Backend;
 use crate::config::{DnsServerConfig, TsigKeyConfig};
 use crate::provider::RecordValue;
 use crate::provider::dynamic::DynamicProvider;
+use crate::telemetry::Metrics;
 use crate::tsig::{self, TSIG_FUDGE};
 use crate::zone_util::derive_zone;
 use anyhow::{Context, Result};
 use hickory_proto::op::{Message, OpCode, ResponseCode};
 use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
 use hickory_proto::rr::{DNSClass, RData, RecordType, TSigner};
+use opentelemetry::KeyValue;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::Notify;
@@ -46,6 +49,7 @@ pub(crate) struct DnsServer {
     backends: Vec<Arc<dyn Backend>>,
     reconcile_notify: Arc<Notify>,
     listen: SocketAddr,
+    metrics: Metrics,
 }
 
 impl DnsServer {
@@ -60,6 +64,7 @@ impl DnsServer {
         dynamic_provider: Arc<DynamicProvider>,
         backends: Vec<Arc<dyn Backend>>,
         reconcile_notify: Arc<Notify>,
+        metrics: Metrics,
     ) -> Result<Self> {
         let listen: SocketAddr = config
             .listen
@@ -101,6 +106,7 @@ impl DnsServer {
             backends,
             reconcile_notify,
             listen,
+            metrics,
         })
     }
 
@@ -129,6 +135,7 @@ impl DnsServer {
             backends,
             reconcile_notify,
             listen,
+            metrics: Metrics::noop(),
         })
     }
 
@@ -198,45 +205,80 @@ impl DnsServer {
     }
 
     /// Process one raw DNS message and return the wire-format response.
+    #[tracing::instrument(skip(self, msg), fields(msg_len = msg.len()))]
     pub(crate) async fn handle_message(&self, msg: &[u8]) -> Vec<u8> {
+        let start = Instant::now();
+
         if msg.len() < 12 {
-            return build_response(0, OpCode::Update, ResponseCode::FormErr);
+            let response = build_response(0, OpCode::Update, ResponseCode::FormErr);
+            self.record_dns_metrics("FORMERR", start);
+            return response;
         }
 
         let id = u16::from_be_bytes([msg[0], msg[1]]);
 
         let Ok(parsed) = Message::from_vec(msg) else {
-            return build_response(id, OpCode::Update, ResponseCode::FormErr);
+            let response = build_response(id, OpCode::Update, ResponseCode::FormErr);
+            self.record_dns_metrics("FORMERR", start);
+            return response;
         };
 
         if parsed.metadata.op_code != OpCode::Update {
             tracing::debug!(opcode = ?parsed.metadata.op_code, "ignoring non-UPDATE DNS message");
-            return build_response(id, parsed.metadata.op_code, ResponseCode::Refused);
+            let response = build_response(id, parsed.metadata.op_code, ResponseCode::Refused);
+            self.record_dns_metrics("REFUSED", start);
+            return response;
         }
 
         match self.handle_update(msg, &parsed).await {
-            Ok(()) => build_response(id, OpCode::Update, ResponseCode::NoError),
-            Err(DnsError::NotAuth) => build_response(id, OpCode::Update, ResponseCode::NotAuth),
+            Ok(()) => {
+                let r = build_response(id, OpCode::Update, ResponseCode::NoError);
+                self.record_dns_metrics("NOERROR", start);
+                r
+            }
+            Err(DnsError::NotAuth) => {
+                let r = build_response(id, OpCode::Update, ResponseCode::NotAuth);
+                self.record_dns_metrics("NOTAUTH", start);
+                r
+            }
             Err(DnsError::Refused(reason)) => {
-                tracing::warn!(reason = %reason, "DNS UPDATE refused");
-                build_response(id, OpCode::Update, ResponseCode::Refused)
+                tracing::debug!(reason = %reason, "DNS UPDATE refused");
+                let r = build_response(id, OpCode::Update, ResponseCode::Refused);
+                self.record_dns_metrics("REFUSED", start);
+                r
             }
             Err(DnsError::PrereqFailed(rcode)) => {
-                tracing::info!(rcode = ?rcode, "DNS UPDATE prerequisite failed");
-                build_response(id, OpCode::Update, rcode)
+                tracing::debug!(rcode = ?rcode, "DNS UPDATE prerequisite failed");
+                let r = build_response(id, OpCode::Update, rcode);
+                self.record_dns_metrics(&format!("{rcode}"), start);
+                r
             }
             Err(DnsError::FormErr(reason)) => {
-                tracing::warn!(reason = %reason, "DNS UPDATE malformed");
-                build_response(id, OpCode::Update, ResponseCode::FormErr)
+                tracing::debug!(reason = %reason, "DNS UPDATE malformed");
+                let r = build_response(id, OpCode::Update, ResponseCode::FormErr);
+                self.record_dns_metrics("FORMERR", start);
+                r
             }
             Err(DnsError::NotZone(reason)) => {
-                tracing::warn!(reason = %reason, "DNS UPDATE: name not in zone");
-                build_response(id, OpCode::Update, ResponseCode::NotZone)
+                tracing::debug!(reason = %reason, "DNS UPDATE: name not in zone");
+                let r = build_response(id, OpCode::Update, ResponseCode::NotZone);
+                self.record_dns_metrics("NOTZONE", start);
+                r
             }
         }
     }
 
+    /// Record DNS server metrics for a processed message.
+    fn record_dns_metrics(&self, rcode: &str, start: Instant) {
+        let elapsed = start.elapsed().as_secs_f64();
+        self.metrics
+            .dns_server_requests
+            .add(1, &[KeyValue::new("rcode", rcode.to_string())]);
+        self.metrics.dns_server_duration.record(elapsed, &[]);
+    }
+
     /// Validate TSIG, parse zone + update sections, and apply each update RR.
+    #[tracing::instrument(skip(self, raw_msg, parsed))]
     async fn handle_update(&self, raw_msg: &[u8], parsed: &Message) -> Result<(), DnsError> {
         // Extract TSIG key name — hickory places the TSIG record in
         // `Message.signature` (not `additionals`) during parsing.
@@ -311,6 +353,7 @@ impl DnsServer {
         }
 
         self.reconcile_notify.notify_one();
+        tracing::info!(client = %client_name, "DNS UPDATE applied successfully");
         Ok(())
     }
 
@@ -503,7 +546,7 @@ impl DnsServer {
                     .set_record(&client, &zone, &name, &type_name, &value, ttl)
                     .await
                     .map_err(|e| DnsError::Refused(e.to_string()))?;
-                tracing::info!(
+                tracing::debug!(
                     client,
                     name,
                     record_type = type_name,
@@ -521,7 +564,7 @@ impl DnsServer {
                     .delete_record(&client, &zone, &name, &type_name)
                     .await
                     .map_err(|e| DnsError::Refused(e.to_string()))?;
-                tracing::info!(
+                tracing::debug!(
                     client,
                     name,
                     record_type = type_name,
@@ -539,7 +582,7 @@ impl DnsServer {
                     .delete_record(&client, &zone, &name, &type_name)
                     .await
                     .map_err(|e| DnsError::Refused(e.to_string()))?;
-                tracing::info!(
+                tracing::debug!(
                     client,
                     name,
                     record_type = type_name,
@@ -552,7 +595,7 @@ impl DnsServer {
                     .delete_all_for_name(&client, &zone, &name)
                     .await
                     .map_err(|e| DnsError::Refused(e.to_string()))?;
-                tracing::info!(
+                tracing::debug!(
                     client,
                     name,
                     zone,

@@ -11,12 +11,16 @@ pub(crate) use error::ApiError;
 
 use axum::{
     Router,
+    extract::State,
+    middleware,
     routing::{get, post},
 };
 use hmac::{Hmac, Mac};
+use opentelemetry::KeyValue;
 use sha2::Sha256;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::Notify;
 
 use crate::backend::Backend;
@@ -82,8 +86,34 @@ pub(crate) struct AppState {
     pub reconciler: Arc<Reconciler>,
     pub backends: Vec<Arc<dyn Backend>>,
     pub reconcile_notify: Arc<Notify>,
-    #[allow(dead_code)] // Available for future API-level instrumentation
     pub metrics: Metrics,
+}
+
+/// Middleware that records HTTP request metrics (count and duration).
+async fn metrics_middleware(
+    State(state): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+    let start = Instant::now();
+    let response = next.run(req).await;
+    let elapsed = start.elapsed().as_secs_f64();
+    let status = response.status().as_u16().to_string();
+    state.metrics.http_requests.add(
+        1,
+        &[
+            KeyValue::new("method", method),
+            KeyValue::new("path", path.clone()),
+            KeyValue::new("status", status),
+        ],
+    );
+    state
+        .metrics
+        .http_duration
+        .record(elapsed, &[KeyValue::new("path", path)]);
+    response
 }
 
 /// Creates the API router with all endpoints.
@@ -100,6 +130,10 @@ pub(crate) fn router(state: Arc<AppState>) -> Router {
         .route("/api/v1/records", get(records::get_records))
         .route("/api/v1/reconcile", post(reconcile::trigger_reconcile))
         .route("/nic/update", get(dyndns::dyndns_update))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            metrics_middleware,
+        ))
         .with_state(state)
 }
 

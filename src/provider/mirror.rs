@@ -146,6 +146,7 @@ impl MirrorProvider {
     ///
     /// Returns an error if the API request fails, the response cannot be parsed,
     /// or the source type is unknown.
+    #[tracing::instrument(skip(self), fields(source_type = %self.config.source.r#type))]
     pub(crate) async fn poll(&self) -> Result<()> {
         let start = Instant::now();
 

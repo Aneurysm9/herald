@@ -233,6 +233,7 @@ impl Rfc2136Backend {
         Ok(records)
     }
 
+    #[tracing::instrument(skip(self), fields(change = %change))]
     async fn apply_change_inner(&self, change: &Change) -> Result<()> {
         match change {
             Change::Create(record) => {

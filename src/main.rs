@@ -348,6 +348,7 @@ async fn run_service(
         metrics,
     });
 
+    let dns_metrics = state.metrics.clone();
     let app = api::router(state);
     let tls_acceptor = tls::load_tls_acceptor(&config.tls).context("loading TLS configuration")?;
     let listener = tokio::net::TcpListener::bind(&config.listen)
@@ -368,6 +369,7 @@ async fn run_service(
             dyn_provider,
             backends.clone(),
             Arc::clone(&reconcile_notify),
+            dns_metrics,
         )
         .await?;
         tokio::spawn(dns_server.run());

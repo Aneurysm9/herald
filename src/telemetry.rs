@@ -48,6 +48,17 @@ pub(crate) struct Metrics {
     // Backend
     pub backend_api_calls: Counter<u64>,
     pub backend_api_duration: Histogram<f64>,
+
+    // DNS UPDATE receiver
+    pub dns_server_requests: Counter<u64>,
+    pub dns_server_duration: Histogram<f64>,
+
+    // HTTP API
+    pub http_requests: Counter<u64>,
+    pub http_duration: Histogram<f64>,
+
+    // Reconciliation drift
+    pub reconciliation_drift: Gauge<u64>,
 }
 
 /// Initialize the OTLP meter provider and set it as the global provider.
@@ -151,6 +162,28 @@ impl Metrics {
                 .f64_histogram("herald.backend.api_duration")
                 .with_description("Duration of backend API calls")
                 .with_unit("s")
+                .build(),
+            dns_server_requests: meter
+                .u64_counter("herald.dns_server.requests")
+                .with_description("DNS UPDATE messages received")
+                .build(),
+            dns_server_duration: meter
+                .f64_histogram("herald.dns_server.duration")
+                .with_description("Duration of DNS UPDATE message handling")
+                .with_unit("s")
+                .build(),
+            http_requests: meter
+                .u64_counter("herald.http.requests")
+                .with_description("HTTP API requests")
+                .build(),
+            http_duration: meter
+                .f64_histogram("herald.http.duration")
+                .with_description("HTTP API request duration")
+                .with_unit("s")
+                .build(),
+            reconciliation_drift: meter
+                .u64_gauge("herald.reconciliation.drift")
+                .with_description("Number of changes needed to converge (0 = converged)")
                 .build(),
         }
     }

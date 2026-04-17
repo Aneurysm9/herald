@@ -48,6 +48,7 @@ impl Reconciler {
     ///
     /// Returns an error if no backends are configured or if zone derivation fails
     /// for any record.
+    #[tracing::instrument(skip(self, providers, backends))]
     pub(crate) async fn reconcile(
         &self,
         providers: &[Arc<dyn Provider>],
@@ -70,6 +71,10 @@ impl Reconciler {
 
         // 4. Diff to compute changes
         let changes = Self::diff(&desired, &all_existing);
+
+        self.metrics
+            .reconciliation_drift
+            .record(changes.len() as u64, &[]);
 
         if changes.is_empty() {
             tracing::info!("no changes needed");
