@@ -12,8 +12,8 @@ use crate::config::{DnsServerConfig, DynamicClientConfig, DynamicProviderConfig}
 use crate::dns_server::DnsServer;
 use crate::provider::dynamic::DynamicProvider;
 use crate::provider::{Named, Provider};
-use crate::rfc2136_util::TSIG_FUDGE;
 use crate::telemetry::Metrics;
+use crate::tsig::TSIG_FUDGE;
 use anyhow::Result;
 use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
 use hickory_proto::rr::{Name, TSigner};

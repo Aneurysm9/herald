@@ -1,11 +1,9 @@
 pub(crate) mod acme;
 pub(crate) mod dynamic;
 pub(crate) mod mirror;
-pub(crate) mod record_type;
 pub(crate) mod record_value;
 pub(crate) mod r#static;
 
-pub(crate) use record_type::RecordType;
 pub(crate) use record_value::RecordValue;
 
 use anyhow::Result;

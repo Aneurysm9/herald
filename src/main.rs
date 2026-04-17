@@ -40,13 +40,12 @@ mod config;
 mod dns_server;
 mod provider;
 mod reconciler;
-#[cfg(test)]
-mod rfc2136_test_helpers;
-mod rfc2136_util;
 mod storage;
-mod technitium_util;
 mod telemetry;
+#[cfg(test)]
+mod testing;
 mod tls;
+mod tsig;
 mod zone_util;
 
 use std::collections::HashMap;

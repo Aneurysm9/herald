@@ -117,15 +117,16 @@ src/
 │   ├── acme.rs       — Ephemeral ACME challenge records
 │   └── dynamic.rs    — API-driven DNS records with permission scoping
 ├── backend/
-│   ├── mod.rs         — Backend trait + Change type
-│   ├── cloudflare.rs  — Cloudflare API implementation (multi-zone support)
-│   ├── technitium.rs  — Technitium DNS Server API implementation (multi-zone support)
-│   └── rfc2136.rs     — RFC 2136 DNS UPDATE backend (SQLite managed-record tracking)
+│   ├── mod.rs             — Backend trait + Change type
+│   ├── cloudflare.rs      — Cloudflare API implementation (multi-zone support)
+│   ├── technitium.rs      — Technitium DNS Server API implementation (multi-zone support)
+│   ├── technitium_util.rs — Shared Technitium API types and utilities
+│   └── rfc2136.rs         — RFC 2136 DNS UPDATE backend (SQLite managed-record tracking)
 ├── reconciler/
 │   └── mod.rs         — Desired vs actual diff + change application
 ├── dns_server.rs      — RFC 2136 DNS UPDATE receiver (nsupdate-compatible server)
-├── rfc2136_util.rs    — Herald ↔ hickory-dns adapter (RecordValue ↔ RData conversions, TSIG key loading)
-└── technitium_util.rs — Shared Technitium API types and utilities
+├── tsig.rs            — TSIG key loading (shared by backend, receiver, mirror)
+└── zone_util.rs       — Zone derivation (longest-suffix matching)
 ```
 
 ## Config File Schema

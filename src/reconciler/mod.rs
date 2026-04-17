@@ -1,5 +1,5 @@
 use crate::backend::{Backend, Change};
-use crate::provider::{DesiredRecord, EnrichedRecord, Provider, RecordType};
+use crate::provider::{DesiredRecord, EnrichedRecord, Provider};
 use crate::telemetry::Metrics;
 use crate::zone_util;
 use anyhow::Result;
@@ -268,7 +268,7 @@ impl Reconciler {
     ) -> Vec<Change> {
         use std::collections::HashSet;
 
-        type RecordKey = (String, String, RecordType); // (zone, name, type)
+        type RecordKey = (String, String, String); // (zone, name, type_str)
 
         // Group desired records by key → Vec<EnrichedRecord>
         let mut desired_map: HashMap<RecordKey, Vec<EnrichedRecord>> = HashMap::new();
@@ -276,7 +276,7 @@ impl Reconciler {
             let key = (
                 record.zone.clone(),
                 record.name.clone(),
-                record.value.record_type(),
+                record.value.type_str().to_string(),
             );
             desired_map.entry(key).or_default().push(record.clone());
         }
@@ -288,7 +288,7 @@ impl Reconciler {
             let key = (
                 record.record.zone.clone(),
                 record.record.name.clone(),
-                record.record.value.record_type(),
+                record.record.value.type_str().to_string(),
             );
             existing_map.entry(key).or_default().push(record.clone());
         }

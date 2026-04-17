@@ -1,6 +1,7 @@
 pub(crate) mod cloudflare;
 pub(crate) mod rfc2136;
 pub(crate) mod technitium;
+pub(crate) mod technitium_util;
 
 use crate::provider::{EnrichedRecord, Named};
 use anyhow::Result;

@@ -1,8 +1,10 @@
 use super::{DesiredRecord, Named, Provider, RecordValue};
+use crate::backend::technitium_util::{
+    TechnitiumResponse, extract_rdata as extract_technitium_rdata,
+};
 use crate::config::MirrorProviderConfig;
-use crate::rfc2136_util::{self, TSIG_FUDGE};
-use crate::technitium_util::{TechnitiumResponse, extract_rdata as extract_technitium_rdata};
 use crate::telemetry::Metrics;
+use crate::tsig::{self, TSIG_FUDGE};
 use anyhow::{Context, Result};
 use hickory_net::client::{Client, ClientHandle};
 use hickory_net::runtime::TokioRuntimeProvider;
@@ -89,7 +91,7 @@ impl MirrorProvider {
                 if let (Some(path), Some(key_name)) =
                     (&config.source.token_file, &config.source.tsig_key_name)
                 {
-                    let signer = rfc2136_util::load_tsigner_from_file(
+                    let signer = tsig::load_tsigner_from_file(
                         key_name,
                         path,
                         TsigAlgorithm::HmacSha256,

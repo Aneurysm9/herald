@@ -1,7 +1,7 @@
+use super::technitium_util::{TechnitiumResponse, extract_rdata};
 use super::{Backend, Change, ExistingRecord};
 use crate::config::TechnitiumConfig;
 use crate::provider::{EnrichedRecord, Named, RecordValue};
-use crate::technitium_util::{TechnitiumResponse, extract_rdata};
 use crate::telemetry::Metrics;
 use anyhow::{Context, Result};
 use opentelemetry::KeyValue;

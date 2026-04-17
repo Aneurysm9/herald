@@ -4,7 +4,6 @@
 //! impossible to construct a mismatched type/value pair (e.g., an A record with
 //! an IPv6 address).
 
-use crate::provider::RecordType;
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::fmt;
@@ -59,34 +58,22 @@ impl RecordValue {
     /// Returns an error if the record type is unsupported or the value cannot be
     /// parsed for the given type.
     pub(crate) fn parse(record_type: &str, value: &str) -> Result<Self> {
-        let rt: RecordType = record_type
-            .parse()
-            .with_context(|| format!("unsupported record type: {record_type}"))?;
-        Self::parse_typed(rt, value)
-    }
-
-    /// Parse a record value from a `RecordType` and value string.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the value cannot be parsed for the given type.
-    pub(crate) fn parse_typed(record_type: RecordType, value: &str) -> Result<Self> {
-        match record_type {
-            RecordType::A => {
+        match record_type.to_ascii_uppercase().as_str() {
+            "A" => {
                 let addr: Ipv4Addr = value
                     .parse()
                     .with_context(|| format!("invalid IPv4 address: {value}"))?;
                 Ok(Self::A(addr))
             }
-            RecordType::AAAA => {
+            "AAAA" => {
                 let addr: Ipv6Addr = value
                     .parse()
                     .with_context(|| format!("invalid IPv6 address: {value}"))?;
                 Ok(Self::AAAA(addr))
             }
-            RecordType::CNAME => Ok(Self::CNAME(value.to_string())),
-            RecordType::TXT => Ok(Self::TXT(value.to_string())),
-            RecordType::MX => {
+            "CNAME" => Ok(Self::CNAME(value.to_string())),
+            "TXT" => Ok(Self::TXT(value.to_string())),
+            "MX" => {
                 let (priority, exchange) = value.split_once(':').ok_or_else(|| {
                     anyhow::anyhow!("invalid MX format (expected priority:exchange): {value}")
                 })?;
@@ -98,9 +85,8 @@ impl RecordValue {
                     exchange: exchange.to_string(),
                 })
             }
-            RecordType::NS => Ok(Self::NS(value.to_string())),
-            RecordType::SRV => {
-                // Format: "priority:weight:port:target"
+            "NS" => Ok(Self::NS(value.to_string())),
+            "SRV" => {
                 let parts: Vec<&str> = value.splitn(4, ':').collect();
                 if parts.len() != 4 {
                     anyhow::bail!(
@@ -120,8 +106,7 @@ impl RecordValue {
                     target: parts[3].to_string(),
                 })
             }
-            RecordType::CAA => {
-                // Format: "flags tag value" (space-separated, value may contain spaces)
+            "CAA" => {
                 let parts: Vec<&str> = value.splitn(3, ' ').collect();
                 if parts.len() != 3 {
                     anyhow::bail!("invalid CAA format (expected 'flags tag value'): {value}");
@@ -134,28 +119,23 @@ impl RecordValue {
                     value: parts[2].to_string(),
                 })
             }
-        }
-    }
-
-    /// Get the `RecordType` discriminant for this value.
-    #[must_use]
-    pub(crate) fn record_type(&self) -> RecordType {
-        match self {
-            Self::A(_) => RecordType::A,
-            Self::AAAA(_) => RecordType::AAAA,
-            Self::CNAME(_) => RecordType::CNAME,
-            Self::TXT(_) => RecordType::TXT,
-            Self::MX { .. } => RecordType::MX,
-            Self::NS(_) => RecordType::NS,
-            Self::SRV { .. } => RecordType::SRV,
-            Self::CAA { .. } => RecordType::CAA,
+            other => anyhow::bail!("unsupported record type: {other}"),
         }
     }
 
     /// Get the string representation of the record type (e.g., "A", "AAAA").
     #[must_use]
     pub(crate) fn type_str(&self) -> &'static str {
-        self.record_type().as_str()
+        match self {
+            Self::A(_) => "A",
+            Self::AAAA(_) => "AAAA",
+            Self::CNAME(_) => "CNAME",
+            Self::TXT(_) => "TXT",
+            Self::MX { .. } => "MX",
+            Self::NS(_) => "NS",
+            Self::SRV { .. } => "SRV",
+            Self::CAA { .. } => "CAA",
+        }
     }
 
     /// Get the value as a string suitable for DNS backend APIs.
@@ -211,6 +191,88 @@ impl Serialize for RecordValue {
     }
 }
 
+// ── hickory-dns RData conversions ────────────────────────────────────────────
+
+use hickory_proto::rr::rdata::{self, A, AAAA, CNAME, MX, NS, TXT};
+use hickory_proto::rr::{Name, RData};
+
+impl TryFrom<&RecordValue> for RData {
+    type Error = anyhow::Error;
+
+    fn try_from(value: &RecordValue) -> Result<Self> {
+        match value {
+            RecordValue::A(ip) => Ok(RData::A(A(*ip))),
+            RecordValue::AAAA(ip) => Ok(RData::AAAA(AAAA(*ip))),
+            RecordValue::CNAME(name) => {
+                let n = Name::from_ascii(name)
+                    .with_context(|| format!("invalid CNAME target: {name}"))?;
+                Ok(RData::CNAME(CNAME(n)))
+            }
+            RecordValue::TXT(text) => Ok(RData::TXT(TXT::new(vec![text.clone()]))),
+            RecordValue::MX { priority, exchange } => {
+                let ex = Name::from_ascii(exchange)
+                    .with_context(|| format!("invalid MX exchange: {exchange}"))?;
+                Ok(RData::MX(MX::new(*priority, ex)))
+            }
+            RecordValue::NS(name) => {
+                let n =
+                    Name::from_ascii(name).with_context(|| format!("invalid NS target: {name}"))?;
+                Ok(RData::NS(NS(n)))
+            }
+            RecordValue::SRV {
+                priority,
+                weight,
+                port,
+                target,
+            } => {
+                let t = Name::from_ascii(target)
+                    .with_context(|| format!("invalid SRV target: {target}"))?;
+                Ok(RData::SRV(rdata::SRV::new(*priority, *weight, *port, t)))
+            }
+            RecordValue::CAA {
+                flags, value: val, ..
+            } => Ok(RData::CAA(rdata::CAA::new_issue(
+                *flags != 0,
+                Some(Name::from_ascii(val).unwrap_or_else(|_| Name::root())),
+                vec![],
+            ))),
+        }
+    }
+}
+
+impl TryFrom<&RData> for RecordValue {
+    type Error = anyhow::Error;
+
+    #[allow(clippy::similar_names)] // txt/text are the standard TXT record data vs. decoded text
+    fn try_from(rdata: &RData) -> Result<Self> {
+        match rdata {
+            RData::A(a) => Ok(RecordValue::A(a.0)),
+            RData::AAAA(aaaa) => Ok(RecordValue::AAAA(aaaa.0)),
+            RData::CNAME(cname) => Ok(RecordValue::CNAME(cname.0.to_utf8())),
+            RData::TXT(txt) => {
+                let text = txt
+                    .txt_data
+                    .iter()
+                    .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
+                    .collect::<String>();
+                Ok(RecordValue::TXT(text))
+            }
+            RData::MX(mx) => Ok(RecordValue::MX {
+                priority: mx.preference,
+                exchange: mx.exchange.to_utf8(),
+            }),
+            RData::NS(ns) => Ok(RecordValue::NS(ns.0.to_utf8())),
+            RData::SRV(srv) => Ok(RecordValue::SRV {
+                priority: srv.priority,
+                weight: srv.weight,
+                port: srv.port,
+                target: srv.target.to_utf8(),
+            }),
+            _ => anyhow::bail!("unsupported RData type for Herald: {rdata:?}"),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,7 +281,7 @@ mod tests {
     fn test_parse_a_record() {
         let rv = RecordValue::parse("A", "203.0.113.1").unwrap();
         assert_eq!(rv, RecordValue::A("203.0.113.1".parse().unwrap()));
-        assert_eq!(rv.record_type(), RecordType::A);
+        assert_eq!(rv.type_str(), "A");
         assert_eq!(rv.type_str(), "A");
         assert_eq!(rv.value_str(), "203.0.113.1");
     }
@@ -228,7 +290,7 @@ mod tests {
     fn test_parse_aaaa_record() {
         let rv = RecordValue::parse("AAAA", "2001:db8::1").unwrap();
         assert_eq!(rv, RecordValue::AAAA("2001:db8::1".parse().unwrap()));
-        assert_eq!(rv.record_type(), RecordType::AAAA);
+        assert_eq!(rv.type_str(), "AAAA");
         assert_eq!(rv.value_str(), "2001:db8::1");
     }
 
@@ -236,7 +298,7 @@ mod tests {
     fn test_parse_cname_record() {
         let rv = RecordValue::parse("CNAME", "example.com").unwrap();
         assert_eq!(rv, RecordValue::CNAME("example.com".to_string()));
-        assert_eq!(rv.record_type(), RecordType::CNAME);
+        assert_eq!(rv.type_str(), "CNAME");
     }
 
     #[test]
@@ -297,7 +359,7 @@ mod tests {
     #[test]
     fn test_parse_case_insensitive_type() {
         let rv = RecordValue::parse("aaaa", "2001:db8::1").unwrap();
-        assert_eq!(rv.record_type(), RecordType::AAAA);
+        assert_eq!(rv.type_str(), "AAAA");
     }
 
     #[test]

@@ -21,9 +21,9 @@
 use super::{Backend, Change, ExistingRecord};
 use crate::config::Rfc2136BackendConfig;
 use crate::provider::{EnrichedRecord, Named, RecordValue};
-use crate::rfc2136_util::{self, TSIG_FUDGE, build_record_set};
 use crate::storage::{SqliteStorage, StorageKey};
 use crate::telemetry::Metrics;
+use crate::tsig::{self, TSIG_FUDGE};
 use anyhow::{Context, Result};
 use hickory_net::client::{Client, ClientHandle};
 use hickory_net::runtime::TokioRuntimeProvider;
@@ -118,7 +118,7 @@ impl Rfc2136Backend {
 
         let tsig_signer = match (&config.tsig_key_file, &config.tsig_key_name) {
             (Some(path), Some(key_name)) => {
-                let signer = rfc2136_util::load_tsigner_from_file(
+                let signer = tsig::load_tsigner_from_file(
                     key_name,
                     path,
                     TsigAlgorithm::HmacSha256,
@@ -383,6 +383,23 @@ impl Rfc2136Backend {
         }
         result
     }
+}
+
+/// Build a single-record `RecordSet` from Herald's enriched record fields.
+fn build_record_set(
+    name: &str,
+    value: &RecordValue,
+    ttl: u32,
+) -> Result<hickory_proto::rr::RecordSet> {
+    use hickory_proto::rr::{RData, Record, RecordSet};
+    let dns_name = hickory_proto::rr::Name::from_ascii(name)
+        .with_context(|| format!("invalid record name: {name}"))?;
+    let rdata = RData::try_from(value)?;
+    let rtype = rdata.record_type();
+    let record = Record::from_rdata(dns_name.clone(), ttl, rdata);
+    let mut rrset = RecordSet::new(dns_name, rtype, 0);
+    rrset.insert(record, 0);
+    Ok(rrset)
 }
 
 impl Named for Rfc2136Backend {

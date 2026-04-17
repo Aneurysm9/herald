@@ -25,7 +25,7 @@ use crate::backend::Backend;
 use crate::config::{DnsServerConfig, TsigKeyConfig};
 use crate::provider::RecordValue;
 use crate::provider::dynamic::DynamicProvider;
-use crate::rfc2136_util::{self, TSIG_FUDGE};
+use crate::tsig::{self, TSIG_FUDGE};
 use crate::zone_util::derive_zone;
 use anyhow::{Context, Result};
 use hickory_proto::op::{Message, OpCode, ResponseCode};
@@ -77,7 +77,7 @@ impl DnsServer {
                     );
                 }
             };
-            let signer = rfc2136_util::load_tsigner_from_file(
+            let signer = tsig::load_tsigner_from_file(
                 &key_config.key_name,
                 &key_config.secret_file,
                 algorithm,
@@ -658,8 +658,8 @@ async fn tcp_send(stream: &mut TcpStream, msg: &[u8]) -> Result<()> {
 #[cfg(test)]
 #[allow(clippy::doc_markdown)]
 mod tests {
-    use crate::rfc2136_test_helpers as helpers;
-    use crate::rfc2136_test_helpers::{
+    use crate::testing as helpers;
+    use crate::testing::{
         DnsServerFixture, FIXTURE_CLIENT, FIXTURE_KEY_NAME, FIXTURE_ZONE, Prereq, TEST_TSIG_SECRET,
         UpdateMessageBuilder, extract_rcode, make_test_tsig_key,
     };
