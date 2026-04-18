@@ -558,9 +558,21 @@ send
 EOF
 ```
 
-### Limitations
+### RFC 2136 Backend Prerequisites
 
-- Prerequisite section (RFC 2136 §3.2) is parsed by hickory but not evaluated — updates always proceed if TSIG authentication succeeds
+The RFC 2136 backend includes prerequisite assertions in DNS UPDATE messages to detect state drift between Herald's SQLite ledger and the authoritative server:
+
+- **CREATE**: Uses §2.4.3 ("RRset does not exist") — rejects if the record already exists
+- **UPDATE**: Uses §2.4.2 ("RRset exists, value dependent") via `compare_and_swap` — atomically swaps old → new in a single UPDATE message, rejects if the server's current value doesn't match
+- **DELETE**: No prerequisite — idempotent, silent if already gone
+
+On prerequisite failure (NXRRSet/YXRRSet), the backend queries the authoritative server to discover actual state and resyncs its SQLite ledger, making the next reconciliation cycle converge correctly.
+
+### Limitations (DNS UPDATE receiver)
+
+The following limitations apply to the DNS UPDATE *receiver* (`dns_server.rs`), not the backend:
+
+- Prerequisite section (RFC 2136 §3.2) is parsed by hickory but not evaluated — incoming updates always proceed if TSIG authentication succeeds
 - `TYPE=ANY` delete-all is parsed but not yet dispatched to the dynamic provider
 - Responses are not TSIG-signed (future work)
 - Zone section validation (ZOCOUNT=1, QTYPE=SOA, QCLASS=IN) is now enforced
@@ -746,13 +758,14 @@ Herald needs to distinguish records it manages from records created manually at 
 10. ✅ **RFC 2136 backend** — DNS UPDATE to BIND/Knot/etc., SQLite managed-record tracking
 11. ✅ **RFC 2136 mirror source** — AXFR zone transfer as a mirror source type (`type: rfc2136`)
 12. ✅ **DNS UPDATE receiver** — nsupdate-compatible server, feeds into dynamic provider
+13. ✅ **RFC 2136 prerequisites** — compare-and-swap for UPDATE, existence checks for CREATE, DNS query resync on drift
 
 **Future:**
 - Metrics / observability — OpenTelemetry metrics are partially implemented, could expand
 - Additional backends — Route53, PowerDNS, etc.
 - Batch operations — Optimize API calls with batch creates/deletes
 - TSIG-signed responses in the DNS UPDATE receiver
-- RFC 2136 prerequisite section evaluation
+- RFC 2136 prerequisite evaluation in the DNS UPDATE receiver (currently only evaluated in the backend)
 
 ## Code Style
 

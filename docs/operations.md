@@ -687,6 +687,9 @@ Herald can manage DNS records on any RFC 2136-compatible authoritative DNS serve
 ### Key characteristics
 
 - **Managed record tracking**: Herald only touches records it created. Pre-existing records in the zone are invisible to the reconciler and will never be modified or deleted.
+- **Prerequisite enforcement**: DNS UPDATE messages include RFC 2136 prerequisite assertions to detect state drift between Herald and the authoritative server. CREATE requires the RRset to not already exist (§2.4.3). UPDATE uses atomic compare-and-swap, asserting the current value matches before swapping (§2.4.2). DELETE has no prerequisite (idempotent).
+- **Self-healing on drift**: When a prerequisite fails (e.g., someone edited a record out-of-band), Herald queries the authoritative server to discover the actual state and updates its local SQLite ledger. The next reconciliation cycle then converges correctly.
+- **Atomic updates**: UPDATE operations are sent as a single DNS UPDATE message (compare-and-swap) rather than separate delete + create messages, eliminating races where one could succeed and the other fail.
 - **TSIG authentication**: All DNS UPDATE messages can be signed with TSIG (RFC 2845/8945). HMAC-SHA256 is the default; the full RFC 8945 algorithm set is supported via hickory-dns. Without a TSIG key, updates are sent unsigned — only use this on trusted networks with server-side IP ACLs.
 - **TCP transport**: All DNS UPDATE messages are sent over TCP.
 - **State database**: Stored at `{state_dir}/rfc2136-{name}.db` — back this up along with your config.
@@ -997,6 +1000,23 @@ These are separate records with no conflict.
   - Delete the manual record and let Herald recreate it (will be tagged)
   - Remove the record from Herald's desired state if you want to keep it manual
 - Herald will never modify or delete records without the managed tag
+
+### RFC 2136 Prerequisite Failure
+
+**Error**: `DNS UPDATE prerequisite failed ... NXRRSet (state drift)` or `... YXRRSet (state drift)`
+
+**Explanation**: Herald's local SQLite state doesn't match the authoritative DNS server. This happens when records are modified or deleted outside of Herald (manual `nsupdate`, another tool, zone reload).
+
+**What Herald does automatically**:
+- Queries the authoritative server to discover actual state
+- Updates its SQLite ledger to match
+- The next reconciliation cycle will generate the correct change
+
+**If it persists**:
+- Check whether another system is managing the same records (conflicting automation)
+- Inspect the SQLite database: `sqlite3 {state_dir}/rfc2136-{name}.db "SELECT * FROM managed_records;"`
+- Compare with actual DNS: `dig @ns1.example.com host.example.com A`
+- As a last resort, delete the SQLite database — Herald will treat all its records as new CREATEs on the next cycle (existing records will fail the "does not exist" prerequisite and be resynced)
 
 ### High API Error Rate
 

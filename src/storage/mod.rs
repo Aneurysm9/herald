@@ -212,6 +212,42 @@ where
 
         Ok(())
     }
+
+    /// Atomically delete one key and insert another in a single transaction.
+    ///
+    /// Used by the RFC 2136 backend to swap managed record keys when a record's
+    /// value changes (the composite key includes the value). If `old_key` does
+    /// not exist the delete is a no-op — the new key is still inserted.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the transaction cannot be started, or if the delete
+    /// or insert fails (in which case neither operation is committed).
+    pub(crate) fn swap(&self, old_key: &K, new_key: &K, new_value: &V) -> Result<()> {
+        let old_key_sql = old_key.to_sql();
+        let new_key_sql = new_key.to_sql();
+        let new_value_json = serde_json::to_string(new_value)
+            .with_context(|| format!("serializing value for key {new_key_sql}"))?;
+
+        #[allow(clippy::cast_possible_wrap)]
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs() as i64;
+
+        let tx = self.conn.unchecked_transaction()?;
+
+        let delete_query = format!("DELETE FROM {} WHERE key = ?1", self.table_name);
+        tx.execute(&delete_query, params![old_key_sql])?;
+
+        let insert_query = format!(
+            "INSERT OR REPLACE INTO {} (key, value, updated_at) VALUES (?1, ?2, ?3)",
+            self.table_name
+        );
+        tx.execute(&insert_query, params![new_key_sql, new_value_json, now])?;
+
+        tx.commit()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -343,5 +379,77 @@ mod tests {
         // Verify count
         let entries = storage.load_all().unwrap();
         assert_eq!(entries.len(), 5);
+    }
+
+    #[test]
+    fn test_swap_basic() {
+        let storage: SqliteStorage<String, TestEntry> =
+            SqliteStorage::in_memory("test_table").unwrap();
+
+        let key1 = "key1".to_string();
+        let key2 = "key2".to_string();
+        let entry1 = TestEntry {
+            value: "old".to_string(),
+            count: 1,
+        };
+        let entry2 = TestEntry {
+            value: "new".to_string(),
+            count: 2,
+        };
+
+        storage.upsert(&key1, &entry1).unwrap();
+
+        // Swap key1 → key2
+        storage.swap(&key1, &key2, &entry2).unwrap();
+
+        let entries = storage.load_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, key2);
+        assert_eq!(entries[0].1.value, "new");
+        assert_eq!(entries[0].1.count, 2);
+    }
+
+    #[test]
+    fn test_swap_same_key() {
+        let storage: SqliteStorage<String, TestEntry> =
+            SqliteStorage::in_memory("test_table").unwrap();
+
+        let key = "key1".to_string();
+        let entry = TestEntry {
+            value: "original".to_string(),
+            count: 1,
+        };
+        storage.upsert(&key, &entry).unwrap();
+
+        // Swap with same key (e.g., TTL-only change)
+        let updated = TestEntry {
+            value: "updated".to_string(),
+            count: 2,
+        };
+        storage.swap(&key, &key, &updated).unwrap();
+
+        let entries = storage.load_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].1.value, "updated");
+    }
+
+    #[test]
+    fn test_swap_nonexistent_old_key() {
+        let storage: SqliteStorage<String, TestEntry> =
+            SqliteStorage::in_memory("test_table").unwrap();
+
+        let old_key = "nonexistent".to_string();
+        let new_key = "key2".to_string();
+        let entry = TestEntry {
+            value: "new".to_string(),
+            count: 1,
+        };
+
+        // Old key doesn't exist — swap should still insert the new key
+        storage.swap(&old_key, &new_key, &entry).unwrap();
+
+        let entries = storage.load_all().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, new_key);
     }
 }

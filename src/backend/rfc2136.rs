@@ -237,14 +237,26 @@ impl Rfc2136Backend {
     async fn apply_change_inner(&self, change: &Change) -> Result<()> {
         match change {
             Change::Create(record) => {
-                self.send_add(record).await?;
+                if let Err(e) = self.send_add(record).await {
+                    tracing::warn!(
+                        record = %record, error = %e,
+                        "CREATE failed, resyncing from DNS"
+                    );
+                    self.resync_from_dns(record).await?;
+                    return Err(e);
+                }
                 self.store_record(record).await?;
             }
             Change::Update { id: _, old, new } => {
-                self.send_delete(old).await?;
-                self.send_add(new).await?;
-                self.delete_record(old).await?;
-                self.store_record(new).await?;
+                if let Err(e) = self.send_compare_and_swap(old, new).await {
+                    tracing::warn!(
+                        old = %old, new = %new, error = %e,
+                        "UPDATE (compare_and_swap) failed, resyncing from DNS"
+                    );
+                    self.resync_from_dns(old).await?;
+                    return Err(e);
+                }
+                self.swap_record(old, new).await?;
             }
             Change::Delete(existing) => {
                 self.send_delete(&existing.record).await?;
@@ -265,10 +277,13 @@ impl Rfc2136Backend {
             .await
             .with_context(|| format!("connecting for ADD: {record}"))?;
 
-        client
+        let response = client
             .create(rrset, zone)
             .await
             .with_context(|| format!("DNS ADD for {record}"))?;
+
+        let desc = record.to_string();
+        check_response_code(&response, "CREATE", &desc)?;
 
         Ok(())
     }
@@ -284,10 +299,13 @@ impl Rfc2136Backend {
             .await
             .with_context(|| format!("connecting for DELETE: {record}"))?;
 
-        client
+        let response = client
             .delete_by_rdata(rrset, zone)
             .await
             .with_context(|| format!("DNS DELETE for {record}"))?;
+
+        let desc = record.to_string();
+        check_response_code(&response, "DELETE", &desc)?;
 
         Ok(())
     }
@@ -325,6 +343,161 @@ impl Rfc2136Backend {
         })
         .await
         .context("database persistence task panicked")??;
+        Ok(())
+    }
+
+    /// Atomically swap a managed record's key in `SQLite` (delete old, insert new)
+    /// in a single transaction.
+    async fn swap_record(&self, old: &EnrichedRecord, new: &EnrichedRecord) -> Result<()> {
+        let old_key = RecordId {
+            name: old.name.clone(),
+            record_type: old.value.type_str().to_string(),
+            value: old.value.value_str().clone(),
+        };
+        let new_key = RecordId {
+            name: new.name.clone(),
+            record_type: new.value.type_str().to_string(),
+            value: new.value.value_str().clone(),
+        };
+        let new_stored = StoredRecord {
+            zone: new.zone.clone(),
+            ttl: new.ttl,
+        };
+        let storage = Arc::clone(&self.storage);
+        tokio::task::spawn_blocking(move || {
+            let storage = storage.blocking_lock();
+            storage.swap(&old_key, &new_key, &new_stored)
+        })
+        .await
+        .context("database swap task panicked")??;
+        Ok(())
+    }
+
+    /// Send a DNS UPDATE with compare-and-swap semantics (RFC 2136 §2.4.2).
+    ///
+    /// Builds a single UPDATE message with a value-dependent prerequisite on the
+    /// old record and atomic delete-old + add-new in the update section.
+    async fn send_compare_and_swap(
+        &self,
+        old: &EnrichedRecord,
+        new: &EnrichedRecord,
+    ) -> Result<()> {
+        let zone = Name::from_ascii(&old.zone)
+            .with_context(|| format!("invalid zone name: {}", old.zone))?;
+        let old_rrset = build_record_set(&old.name, &old.value, old.ttl)
+            .with_context(|| format!("building record set for CAS old: {old}"))?;
+        let new_rrset = build_record_set(&new.name, &new.value, new.ttl)
+            .with_context(|| format!("building record set for CAS new: {new}"))?;
+
+        let mut client = self
+            .connect_client()
+            .await
+            .with_context(|| format!("connecting for UPDATE: {old} -> {new}"))?;
+
+        let response = client
+            .compare_and_swap(old_rrset, new_rrset, zone)
+            .await
+            .with_context(|| format!("DNS UPDATE (compare_and_swap) for {old} -> {new}"))?;
+
+        let desc = format!("{old} -> {new}");
+        check_response_code(&response, "UPDATE", &desc)?;
+
+        Ok(())
+    }
+
+    /// Query the authoritative server for a record's current state.
+    ///
+    /// Returns the answer RDATAs, or an empty vec if the name does not exist or
+    /// has no records of the requested type.
+    async fn query_record(
+        &self,
+        name: &str,
+        record_type: hickory_proto::rr::RecordType,
+    ) -> Result<Vec<hickory_proto::rr::RData>> {
+        use hickory_proto::rr::DNSClass;
+
+        let dns_name = Name::from_ascii(name)
+            .with_context(|| format!("invalid record name for query: {name}"))?;
+
+        let mut client = self
+            .connect_client()
+            .await
+            .with_context(|| format!("connecting for query: {name} {record_type}"))?;
+
+        let response = client.query(dns_name, DNSClass::IN, record_type).await;
+
+        match response {
+            Ok(resp) => {
+                let rdata: Vec<_> = resp.answers.iter().map(|r| r.data.clone()).collect();
+                Ok(rdata)
+            }
+            Err(e) => {
+                // NXDOMAIN or no-records errors are normal — the record doesn't exist
+                tracing::debug!(
+                    name, %record_type, error = %e,
+                    "query returned no records (expected during resync)"
+                );
+                Ok(vec![])
+            }
+        }
+    }
+
+    /// Resync `SQLite` state by querying the authoritative DNS server.
+    ///
+    /// Called when a prerequisite fails — discovers what the server actually has
+    /// and updates `SQLite` to match. This makes the next reconciliation cycle
+    /// generate the correct change (or no change if the record is already right).
+    async fn resync_from_dns(&self, record: &EnrichedRecord) -> Result<()> {
+        let record_type = record.value.dns_record_type();
+
+        let answers = self
+            .query_record(&record.name, record_type)
+            .await
+            .with_context(|| format!("querying DNS for resync: {record}"))?;
+
+        if answers.is_empty() {
+            // Record doesn't exist on server — remove from SQLite
+            tracing::info!(
+                record = %record,
+                "resync: record not found on server, removing from local state"
+            );
+            self.delete_record(record).await?;
+        } else {
+            // Record exists on server — update SQLite with actual values.
+            // Store the first matching answer (single-value records are the
+            // common case for Herald-managed records).
+            for rdata in &answers {
+                match RecordValue::try_from(rdata) {
+                    Ok(actual_value) => {
+                        let actual_record = EnrichedRecord {
+                            zone: record.zone.clone(),
+                            name: record.name.clone(),
+                            value: actual_value,
+                            ttl: record.ttl,
+                        };
+                        tracing::info!(
+                            old = %record,
+                            actual = %actual_record,
+                            "resync: updating local state to match server"
+                        );
+                        self.swap_record(record, &actual_record).await?;
+                        return Ok(());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            rdata = ?rdata, error = %e,
+                            "resync: skipping unsupported RData type"
+                        );
+                    }
+                }
+            }
+            // All answers were unsupported types — remove stale entry
+            tracing::warn!(
+                record = %record,
+                "resync: no convertible records found on server, removing from local state"
+            );
+            self.delete_record(record).await?;
+        }
         Ok(())
     }
 
@@ -386,6 +559,41 @@ impl Rfc2136Backend {
     }
 }
 
+/// Inspect a DNS response and convert non-success response codes to errors.
+///
+/// Prerequisite failures (`NXRRSet`, `YXRRSet`) produce specific "state drift"
+/// messages so operators can distinguish them from server errors.
+///
+/// Takes `&Message` (not `&DnsResponse`) so the function is unit-testable
+/// without constructing the full `DnsResponse` wrapper. Callers holding a
+/// `DnsResponse` can pass `&*response` thanks to its `Deref<Target=Message>`.
+fn check_response_code(
+    response: &hickory_proto::op::Message,
+    operation: &str,
+    record_desc: &str,
+) -> Result<()> {
+    use hickory_proto::op::ResponseCode;
+
+    match response.metadata.response_code {
+        ResponseCode::NoError => Ok(()),
+        ResponseCode::NXRRSet => {
+            anyhow::bail!(
+                "DNS {operation} prerequisite failed for {record_desc}: \
+                 server returned NXRRSet (expected RRset does not exist — state drift)"
+            );
+        }
+        ResponseCode::YXRRSet => {
+            anyhow::bail!(
+                "DNS {operation} prerequisite failed for {record_desc}: \
+                 server returned YXRRSet (RRset already exists — state drift)"
+            );
+        }
+        code => {
+            anyhow::bail!("DNS {operation} for {record_desc} failed: server returned {code}");
+        }
+    }
+}
+
 /// Build a single-record `RecordSet` from Herald's enriched record fields.
 fn build_record_set(
     name: &str,
@@ -425,5 +633,68 @@ impl Backend for Rfc2136Backend {
         change: &'a Change,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
         Box::pin(self.apply_change_with_metrics(change))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::op::{Message, OpCode, ResponseCode};
+
+    fn make_response(code: ResponseCode) -> Message {
+        let mut msg = Message::query();
+        msg.metadata.op_code = OpCode::Update;
+        msg.metadata.response_code = code;
+        msg
+    }
+
+    #[test]
+    fn test_check_response_code_noerror() {
+        let msg = make_response(ResponseCode::NoError);
+        assert!(check_response_code(&msg, "CREATE", "test.example.com A").is_ok());
+    }
+
+    #[test]
+    fn test_check_response_code_nxrrset() {
+        let msg = make_response(ResponseCode::NXRRSet);
+        let err = check_response_code(&msg, "UPDATE", "test.example.com A")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("NXRRSet"),
+            "error should mention NXRRSet: {err}"
+        );
+        assert!(
+            err.contains("state drift"),
+            "error should mention state drift: {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_response_code_yxrrset() {
+        let msg = make_response(ResponseCode::YXRRSet);
+        let err = check_response_code(&msg, "CREATE", "test.example.com A")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("YXRRSet"),
+            "error should mention YXRRSet: {err}"
+        );
+        assert!(
+            err.contains("state drift"),
+            "error should mention state drift: {err}"
+        );
+    }
+
+    #[test]
+    fn test_check_response_code_servfail() {
+        let msg = make_response(ResponseCode::ServFail);
+        let err = check_response_code(&msg, "DELETE", "test.example.com A")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Server Failure"),
+            "error should mention Server Failure: {err}"
+        );
     }
 }

@@ -138,6 +138,24 @@ impl RecordValue {
         }
     }
 
+    /// Get the hickory-dns `RecordType` for this value.
+    ///
+    /// Used by the RFC 2136 backend to query the authoritative server for a
+    /// specific record type during state resync.
+    #[must_use]
+    pub(crate) fn dns_record_type(&self) -> RecordType {
+        match self {
+            Self::A(_) => RecordType::A,
+            Self::AAAA(_) => RecordType::AAAA,
+            Self::CNAME(_) => RecordType::CNAME,
+            Self::TXT(_) => RecordType::TXT,
+            Self::MX { .. } => RecordType::MX,
+            Self::NS(_) => RecordType::NS,
+            Self::SRV { .. } => RecordType::SRV,
+            Self::CAA { .. } => RecordType::CAA,
+        }
+    }
+
     /// Get the value as a string suitable for DNS backend APIs.
     ///
     /// For most types this is the standard string representation.
@@ -194,7 +212,7 @@ impl Serialize for RecordValue {
 // ── hickory-dns RData conversions ────────────────────────────────────────────
 
 use hickory_proto::rr::rdata::{self, A, AAAA, CNAME, MX, NS, TXT};
-use hickory_proto::rr::{Name, RData};
+use hickory_proto::rr::{Name, RData, RecordType};
 
 impl TryFrom<&RecordValue> for RData {
     type Error = anyhow::Error;
@@ -454,5 +472,33 @@ mod tests {
         };
         let json = serde_json::to_string(&rv).unwrap();
         assert_eq!(json, "\"10:mail.example.com\"");
+    }
+
+    #[test]
+    fn test_dns_record_type() {
+        assert_eq!(
+            RecordValue::A("1.2.3.4".parse().unwrap()).dns_record_type(),
+            RecordType::A
+        );
+        assert_eq!(
+            RecordValue::AAAA("::1".parse().unwrap()).dns_record_type(),
+            RecordType::AAAA
+        );
+        assert_eq!(
+            RecordValue::CNAME("example.com".into()).dns_record_type(),
+            RecordType::CNAME
+        );
+        assert_eq!(
+            RecordValue::TXT("hello".into()).dns_record_type(),
+            RecordType::TXT
+        );
+        assert_eq!(
+            RecordValue::MX {
+                priority: 10,
+                exchange: "mail.example.com".into()
+            }
+            .dns_record_type(),
+            RecordType::MX
+        );
     }
 }
