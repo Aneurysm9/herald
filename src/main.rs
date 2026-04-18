@@ -104,6 +104,7 @@ async fn main() -> Result<()> {
     tracing::info!(config = %cli.config, "starting herald");
 
     let config = config::load(&cli.config)?;
+    config.validate()?;
 
     // Initialize telemetry
     let meter_provider = if config.telemetry.enabled {
