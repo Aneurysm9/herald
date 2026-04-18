@@ -60,6 +60,14 @@ pub(crate) struct Config {
     #[serde(default = "default_state_dir")]
     pub state_dir: String,
 
+    /// Global rate limiting configuration.
+    ///
+    /// Sets a default per-client rate limit applied to all authenticated
+    /// endpoints (API, `DynDNS`, DNS UPDATE). Per-client overrides in provider
+    /// configs take precedence. If omitted, no rate limiting is applied.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
+
     /// DNS UPDATE server configuration (RFC 2136 receiver).
     ///
     /// When set, Herald starts a DNS UPDATE server on the specified address.
@@ -319,6 +327,10 @@ pub(crate) struct AcmeClientConfig {
     /// Supports wildcards: `*.example.org` matches `host.example.org`,
     /// `deep.sub.example.org`, etc.
     pub allowed_domains: Vec<String>,
+
+    /// Per-client rate limit override.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// Configuration for the dynamic DNS update provider.
@@ -341,6 +353,10 @@ pub(crate) struct DynamicClientConfig {
     pub allowed_domains: Vec<String>,
     /// Zones this client is allowed to target
     pub allowed_zones: Vec<String>,
+
+    /// Per-client rate limit override.
+    #[serde(default)]
+    pub rate_limit: Option<RateLimitConfig>,
 }
 
 /// Configuration for the DNS UPDATE receiver (RFC 2136 server).
@@ -392,6 +408,19 @@ pub(crate) struct TsigKeyConfig {
 
 fn default_tsig_algorithm() -> String {
     "hmac-sha256".to_string()
+}
+
+/// Per-client or global rate limiting configuration.
+///
+/// Configures a token-bucket rate limiter. Can be set globally on `Config`
+/// (default for all clients) and overridden per-client in `AcmeClientConfig`
+/// or `DynamicClientConfig`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub(crate) struct RateLimitConfig {
+    /// Maximum sustained requests per second.
+    pub requests_per_second: u32,
+    /// Maximum burst capacity (requests allowed in a single burst).
+    pub burst: u32,
 }
 
 /// Reconciler configuration.
@@ -637,6 +666,7 @@ mod tests {
             telemetry: TelemetryConfig::default(),
             tokens_file: None,
             state_dir: "/tmp/herald".to_string(),
+            rate_limit: None,
             dns_server: None,
         }
     }
@@ -683,6 +713,7 @@ mod tests {
                 DynamicClientConfig {
                     allowed_domains: vec!["*.example.com".to_string()],
                     allowed_zones: vec!["nonexistent.org".to_string()],
+                    rate_limit: None,
                 },
             )]),
         });
@@ -718,6 +749,7 @@ mod tests {
                 DynamicClientConfig {
                     allowed_domains: vec!["*.example.com".to_string()],
                     allowed_zones: vec!["example.com".to_string()],
+                    rate_limit: None,
                 },
             )]),
         });

@@ -555,6 +555,7 @@ impl DnsServerFixture {
             DynamicClientConfig {
                 allowed_domains: vec![format!("*.{FIXTURE_ZONE}"), FIXTURE_ZONE.to_string()],
                 allowed_zones: vec![FIXTURE_ZONE.to_string()],
+                rate_limit: None,
             },
         );
         Self::build_with_clients(backend_zones, clients).await

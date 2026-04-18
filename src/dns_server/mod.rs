@@ -57,6 +57,7 @@ pub(crate) struct DnsServer {
     reconcile_notify: Arc<Notify>,
     listen: SocketAddr,
     metrics: Metrics,
+    rate_limiter: Option<Arc<crate::rate_limit::RateLimiterRegistry>>,
 }
 
 impl DnsServer {
@@ -72,6 +73,7 @@ impl DnsServer {
         backends: Vec<Arc<dyn Backend>>,
         reconcile_notify: Arc<Notify>,
         metrics: Metrics,
+        rate_limiter: Option<Arc<crate::rate_limit::RateLimiterRegistry>>,
     ) -> Result<Self> {
         let listen: SocketAddr = config
             .listen
@@ -114,6 +116,7 @@ impl DnsServer {
             reconcile_notify,
             listen,
             metrics,
+            rate_limiter,
         })
     }
 
@@ -143,6 +146,7 @@ impl DnsServer {
             reconcile_notify,
             listen,
             metrics: Metrics::noop(),
+            rate_limiter: None,
         })
     }
 
@@ -318,6 +322,18 @@ impl DnsServer {
                 }
             }
             Err(_) => return Err(DnsError::NotAuth),
+        }
+
+        // Check rate limit after successful TSIG authentication.
+        if let Some(ref limiter) = self.rate_limiter
+            && limiter.check(client_name).is_err()
+        {
+            self.metrics
+                .rate_limit_rejected
+                .add(1, &[KeyValue::new("client", client_name.clone())]);
+            return Err(DnsError::Refused(format!(
+                "rate limit exceeded for client {client_name}"
+            )));
         }
 
         // Zone section validation (RFC 2136 §2.3): ZOCOUNT must be 1,

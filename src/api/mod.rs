@@ -87,6 +87,7 @@ pub(crate) struct AppState {
     pub backends: Vec<Arc<dyn Backend>>,
     pub reconcile_notify: Arc<Notify>,
     pub metrics: Metrics,
+    pub rate_limiter: Option<Arc<crate::rate_limit::RateLimiterRegistry>>,
 }
 
 /// Middleware that records HTTP request metrics (count and duration).
@@ -218,6 +219,7 @@ pub(crate) mod tests {
             "testclient".to_string(),
             AcmeClientConfig {
                 allowed_domains: vec!["test.example.com".to_string()],
+                rate_limit: None,
             },
         );
         let acme_provider = Arc::new(
@@ -243,6 +245,7 @@ pub(crate) mod tests {
             backends: vec![Arc::new(StubBackend { existing: vec![] })],
             reconcile_notify: Arc::new(Notify::new()),
             metrics: Metrics::noop(),
+            rate_limiter: None,
         });
 
         let app = router(state);
@@ -256,6 +259,7 @@ pub(crate) mod tests {
             crate::config::DynamicClientConfig {
                 allowed_domains: vec!["*.example.com".to_string()],
                 allowed_zones: vec!["example.com".to_string()],
+                rate_limit: None,
             },
         );
         let dynamic_provider = Arc::new(
@@ -278,6 +282,7 @@ pub(crate) mod tests {
             backends: vec![Arc::new(StubBackend { existing: vec![] })],
             reconcile_notify: Arc::new(Notify::new()),
             metrics: Metrics::noop(),
+            rate_limiter: None,
         })
     }
 }

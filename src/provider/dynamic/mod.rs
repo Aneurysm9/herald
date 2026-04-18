@@ -402,6 +402,7 @@ mod tests {
         clients.insert(
             "opnsense".to_string(),
             DynamicClientConfig {
+                rate_limit: None,
                 allowed_domains: vec!["*.example.com".to_string()],
                 allowed_zones: vec!["example.com".to_string()],
             },
@@ -409,6 +410,7 @@ mod tests {
         clients.insert(
             "other".to_string(),
             DynamicClientConfig {
+                rate_limit: None,
                 allowed_domains: vec!["other.example.org".to_string()],
                 allowed_zones: vec!["example.org".to_string()],
             },
@@ -524,6 +526,7 @@ mod tests {
         clients.insert(
             "owner".to_string(),
             DynamicClientConfig {
+                rate_limit: None,
                 allowed_domains: vec!["shared.example.com".to_string()],
                 allowed_zones: vec!["example.com".to_string()],
             },
@@ -531,6 +534,7 @@ mod tests {
         clients.insert(
             "thief".to_string(),
             DynamicClientConfig {
+                rate_limit: None,
                 allowed_domains: vec!["shared.example.com".to_string()],
                 allowed_zones: vec!["example.com".to_string()],
             },

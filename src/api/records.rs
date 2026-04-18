@@ -103,6 +103,7 @@ mod tests {
             })],
             reconcile_notify: Arc::new(Notify::new()),
             metrics: Metrics::noop(),
+            rate_limiter: None,
         });
 
         let server = TestServer::new(router(state).into_make_service()).unwrap();
@@ -167,6 +168,7 @@ mod tests {
             })],
             reconcile_notify: Arc::new(Notify::new()),
             metrics: Metrics::noop(),
+            rate_limiter: None,
         });
 
         let server = TestServer::new(router(state).into_make_service()).unwrap();
