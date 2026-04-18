@@ -42,3 +42,106 @@ pub(crate) async fn load_tsigner_from_file(
     TSigner::new(secret, algorithm, name, fudge)
         .map_err(|e| anyhow::anyhow!("creating TSigner: {e}"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hickory_proto::rr::rdata::tsig::TsigAlgorithm;
+
+    /// Write `content` to a temp path and return the path.
+    fn write_temp(label: &str, content: &str) -> String {
+        let path = format!("/tmp/herald-tsig-test-{}-{label}", std::process::id());
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[tokio::test]
+    async fn test_load_valid_key() {
+        // 32 random bytes encoded as base64 — a valid HMAC-SHA256 key.
+        let secret = b"herald-test-key-exactly-32-bytes";
+        let b64 = BASE64.encode(secret);
+        let path = write_temp("valid", &b64);
+        load_tsigner_from_file(
+            "test.example.com",
+            &path,
+            TsigAlgorithm::HmacSha256,
+            TSIG_FUDGE,
+        )
+        .await
+        .map_err(|e| e.to_string())
+        .expect("valid base64 key should load successfully");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_load_valid_key_with_trailing_newline() {
+        let secret = b"herald-test-key-exactly-32-bytes";
+        let b64 = format!("{}\n", BASE64.encode(secret));
+        let path = write_temp("trailing-newline", &b64);
+        load_tsigner_from_file(
+            "test.example.com",
+            &path,
+            TsigAlgorithm::HmacSha256,
+            TSIG_FUDGE,
+        )
+        .await
+        .map_err(|e| e.to_string())
+        .expect("trailing newline should be trimmed and key loaded");
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_load_missing_file_returns_error() {
+        let err = load_tsigner_from_file(
+            "test.example.com",
+            "/tmp/herald-tsig-does-not-exist-xyz",
+            TsigAlgorithm::HmacSha256,
+            TSIG_FUDGE,
+        )
+        .await
+        .err()
+        .expect("expected an error for missing file")
+        .to_string();
+        assert!(
+            err.contains("TSIG key file"),
+            "error should mention TSIG key file, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_invalid_base64_returns_error() {
+        let path = write_temp("invalid-b64", "!!!notbase64!!!");
+        let err = load_tsigner_from_file(
+            "test.example.com",
+            &path,
+            TsigAlgorithm::HmacSha256,
+            TSIG_FUDGE,
+        )
+        .await
+        .err()
+        .expect("expected an error for invalid base64")
+        .to_string();
+        assert!(
+            err.contains("base64"),
+            "error should mention base64 decoding, got: {err}"
+        );
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[tokio::test]
+    async fn test_load_invalid_key_name_returns_error() {
+        let secret = b"herald-test-key-exactly-32-bytes";
+        let b64 = BASE64.encode(secret);
+        let path = write_temp("bad-keyname", &b64);
+        // A label with invalid characters is rejected by hickory's Name parser.
+        let result = load_tsigner_from_file(
+            "this is not a valid dns name!!!",
+            &path,
+            TsigAlgorithm::HmacSha256,
+            TSIG_FUDGE,
+        )
+        .await;
+        assert!(result.is_err(), "invalid key name should be rejected");
+        std::fs::remove_file(&path).ok();
+    }
+}

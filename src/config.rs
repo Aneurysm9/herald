@@ -642,6 +642,8 @@ pub(crate) fn load(path: &str) -> Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use figment::Figment;
+    use figment::providers::Yaml;
 
     /// Build a minimal valid Config for testing. Each test overrides
     /// the specific field it wants to invalidate.
@@ -670,6 +672,139 @@ mod tests {
             dns_server: None,
         }
     }
+
+    // ── Default value tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_default_listen_is_dual_stack() {
+        assert_eq!(default_listen(), "[::]:8443");
+    }
+
+    #[test]
+    fn test_default_state_dir() {
+        assert_eq!(default_state_dir(), "/var/lib/herald");
+    }
+
+    #[test]
+    fn test_default_reconciler_interval() {
+        assert_eq!(default_reconciler_interval(), "1m");
+    }
+
+    #[test]
+    fn test_default_ttl_is_300() {
+        assert_eq!(default_ttl(), 300);
+    }
+
+    #[test]
+    fn test_default_dns_listen() {
+        assert_eq!(default_dns_listen(), "[::]:5353");
+    }
+
+    #[test]
+    fn test_default_mirror_interval() {
+        assert_eq!(default_interval(), "5m");
+    }
+
+    #[test]
+    fn test_default_tsig_algorithm() {
+        assert_eq!(default_tsig_algorithm(), "hmac-sha256");
+    }
+
+    // ── YAML parsing tests ────────────────────────────────────────────────────
+
+    fn parse_yaml(yaml: &'static str) -> Config {
+        Figment::new()
+            .merge(Yaml::string(yaml))
+            .extract()
+            .expect("valid YAML config")
+    }
+
+    #[test]
+    fn test_parse_minimal_yaml_applies_defaults() {
+        let config = parse_yaml("tls:\n  cert_file: /tmp/cert.pem\n  key_file: /tmp/key.pem\n");
+        assert_eq!(config.listen, "[::]:8443");
+        assert_eq!(config.state_dir, "/var/lib/herald");
+        // reconciler.dry_run defaults to false when reconciler section is absent
+        assert!(!config.reconciler.dry_run);
+        assert!(config.backends.cloudflare.is_empty());
+        assert!(config.providers.dynamic.is_none());
+    }
+
+    #[test]
+    fn test_parse_custom_listen_address() {
+        let config =
+            parse_yaml("listen: \"0.0.0.0:9443\"\ntls:\n  cert_file: /c\n  key_file: /k\n");
+        assert_eq!(config.listen, "0.0.0.0:9443");
+    }
+
+    #[test]
+    fn test_parse_static_record_inherits_default_ttl() {
+        let config = parse_yaml(
+            "tls:\n  cert_file: /c\n  key_file: /k\n\
+             providers:\n  static:\n    records:\n\
+             \x20\x20\x20\x20\x20\x20- name: www.example.com\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20type: A\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20value: 1.2.3.4\n",
+        );
+        let records = &config.providers.r#static.unwrap().records;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].ttl, 300);
+        assert_eq!(records[0].name, "www.example.com");
+    }
+
+    #[test]
+    fn test_parse_static_record_explicit_ttl() {
+        let config = parse_yaml(
+            "tls:\n  cert_file: /c\n  key_file: /k\n\
+             providers:\n  static:\n    records:\n\
+             \x20\x20\x20\x20\x20\x20- name: apex.example.com\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20type: A\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20value: 1.2.3.4\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20ttl: 60\n",
+        );
+        let records = &config.providers.r#static.unwrap().records;
+        assert_eq!(records[0].ttl, 60);
+    }
+
+    #[test]
+    fn test_parse_reconciler_dry_run() {
+        let config = parse_yaml(
+            "tls:\n  cert_file: /c\n  key_file: /k\n\
+             reconciler:\n  dry_run: true\n  interval: \"30s\"\n",
+        );
+        assert!(config.reconciler.dry_run);
+        assert_eq!(config.reconciler.interval, "30s");
+    }
+
+    #[test]
+    fn test_parse_rate_limit_config() {
+        let config = parse_yaml(
+            "tls:\n  cert_file: /c\n  key_file: /k\n\
+             rate_limit:\n  requests_per_second: 10\n  burst: 20\n",
+        );
+        let rl = config.rate_limit.unwrap();
+        assert_eq!(rl.requests_per_second, 10);
+        assert_eq!(rl.burst, 20);
+    }
+
+    #[test]
+    fn test_parse_missing_tls_fails() {
+        let result: Result<Config, _> = Figment::new()
+            .merge(Yaml::string("listen: \"[::]:8443\"\n"))
+            .extract();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_tokens_file() {
+        let config = parse_yaml(
+            "tls:\n  cert_file: /c\n  key_file: /k\n\
+             tokens_file: /run/secrets/tokens\n",
+        );
+        assert_eq!(config.tokens_file.as_deref(), Some("/run/secrets/tokens"));
+    }
+
+    // ── Validation tests ──────────────────────────────────────────────────────
 
     #[test]
     fn test_validate_valid_config_passes() {
