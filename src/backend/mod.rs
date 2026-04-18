@@ -21,7 +21,7 @@ pub(crate) struct ExistingRecord {
 }
 
 /// A change to apply to the backend.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) enum Change {
     Create(EnrichedRecord),
     Update {

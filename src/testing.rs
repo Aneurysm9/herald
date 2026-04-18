@@ -441,10 +441,14 @@ pub(crate) fn extract_opcode(response: &[u8]) -> u8 {
 /// `Backend` impl for tests. When `provider` is set, `get_records()` returns
 /// the provider's current records as `ExistingRecord`s — this is needed for
 /// prereq evaluation, which checks against actual zone contents.
+///
+/// Applied changes are recorded in `applied_changes` for integration test
+/// assertions.
 pub(crate) struct FakeBackend {
     name: String,
     zones: Vec<String>,
     provider: Option<Arc<DynamicProvider>>,
+    applied_changes: tokio::sync::Mutex<Vec<Change>>,
 }
 
 impl FakeBackend {
@@ -457,7 +461,24 @@ impl FakeBackend {
             name: name.into(),
             zones,
             provider: Some(provider),
+            applied_changes: tokio::sync::Mutex::new(Vec::new()),
         })
+    }
+
+    /// Create a `FakeBackend` without a provider (returns empty records).
+    pub(crate) fn arc_empty(name: impl Into<String>, zones: Vec<String>) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.into(),
+            zones,
+            provider: None,
+            applied_changes: tokio::sync::Mutex::new(Vec::new()),
+        })
+    }
+
+    /// Return all changes that have been applied to this backend.
+    pub(crate) async fn take_applied_changes(&self) -> Vec<Change> {
+        let mut changes = self.applied_changes.lock().await;
+        std::mem::take(&mut *changes)
     }
 }
 
@@ -500,9 +521,12 @@ impl Backend for FakeBackend {
 
     fn apply_change<'a>(
         &'a self,
-        _change: &'a Change,
+        change: &'a Change,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + 'a>> {
-        Box::pin(async move { Ok(()) })
+        Box::pin(async move {
+            self.applied_changes.lock().await.push(change.clone());
+            Ok(())
+        })
     }
 }
 
