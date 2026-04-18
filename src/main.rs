@@ -38,6 +38,8 @@ mod api;
 mod backend;
 mod config;
 mod dns_server;
+#[cfg(test)]
+mod integration_tests;
 mod provider;
 mod reconciler;
 mod storage;
