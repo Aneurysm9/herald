@@ -59,6 +59,9 @@ pub(crate) struct Metrics {
 
     // Reconciliation drift
     pub reconciliation_drift: Gauge<u64>,
+
+    // Rate limiting
+    pub rate_limit_rejected: Counter<u64>,
 }
 
 /// Initialize the OTLP meter provider and set it as the global provider.
@@ -184,6 +187,10 @@ impl Metrics {
             reconciliation_drift: meter
                 .u64_gauge("herald.reconciliation.drift")
                 .with_description("Number of changes needed to converge (0 = converged)")
+                .build(),
+            rate_limit_rejected: meter
+                .u64_counter("herald.rate_limit.rejected")
+                .with_description("Requests rejected by rate limiting")
                 .build(),
         }
     }

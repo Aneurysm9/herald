@@ -29,6 +29,10 @@ pub(crate) enum ApiError {
     #[error("{0}")]
     NotConfigured(String),
 
+    /// 429 — too many requests from this client.
+    #[error("rate limit exceeded")]
+    RateLimited,
+
     /// 500 — unexpected internal failure.
     /// The wrapped error is logged server-side but not exposed to clients.
     #[error("internal error")]
@@ -56,6 +60,7 @@ impl ApiError {
             Self::Forbidden(_) => StatusCode::FORBIDDEN,
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotConfigured(_) => StatusCode::NOT_IMPLEMENTED,
+            Self::RateLimited => StatusCode::TOO_MANY_REQUESTS,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -67,6 +72,7 @@ impl ApiError {
             Self::Forbidden(_) => "FORBIDDEN",
             Self::BadRequest(_) => "BAD_REQUEST",
             Self::NotConfigured(_) => "NOT_CONFIGURED",
+            Self::RateLimited => "RATE_LIMITED",
             Self::Internal(_) => "INTERNAL_ERROR",
         }
     }

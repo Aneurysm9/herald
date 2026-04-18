@@ -60,7 +60,20 @@ where
             .get("authorization")
             .and_then(|v| v.to_str().ok());
 
-        authenticate(&state, auth_header).map(AuthenticatedClient)
+        let client = authenticate(&state, auth_header)?;
+
+        // Check rate limit after successful auth
+        if let Some(ref limiter) = state.rate_limiter
+            && limiter.check(&client).is_err()
+        {
+            state
+                .metrics
+                .rate_limit_rejected
+                .add(1, &[opentelemetry::KeyValue::new("client", client.clone())]);
+            return Err(ApiError::RateLimited);
+        }
+
+        Ok(AuthenticatedClient(client))
     }
 }
 

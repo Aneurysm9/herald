@@ -270,12 +270,14 @@ mod tests {
         clients.insert(
             "client_a".to_string(),
             AcmeClientConfig {
+                rate_limit: None,
                 allowed_domains: vec!["alpha.example.com".to_string()],
             },
         );
         clients.insert(
             "client_b".to_string(),
             AcmeClientConfig {
+                rate_limit: None,
                 allowed_domains: vec!["beta.example.com".to_string()],
             },
         );
@@ -338,12 +340,14 @@ mod tests {
         clients.insert(
             "client_a".to_string(),
             AcmeClientConfig {
+                rate_limit: None,
                 allowed_domains: vec!["shared.example.com".to_string()],
             },
         );
         clients.insert(
             "client_b".to_string(),
             AcmeClientConfig {
+                rate_limit: None,
                 allowed_domains: vec!["shared.example.com".to_string()],
             },
         );
@@ -400,6 +404,7 @@ mod tests {
         clients.insert(
             "wildcard_client".to_string(),
             AcmeClientConfig {
+                rate_limit: None,
                 allowed_domains: vec!["*.example.com".to_string()],
             },
         );

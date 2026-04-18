@@ -52,6 +52,17 @@ pub(super) async fn dyndns_update(
         return (StatusCode::UNAUTHORIZED, "badauth\n").into_response();
     }
 
+    // Check rate limit
+    if let Some(ref limiter) = state.rate_limiter
+        && limiter.check(&client).is_err()
+    {
+        state
+            .metrics
+            .rate_limit_rejected
+            .add(1, &[opentelemetry::KeyValue::new("client", client.clone())]);
+        return (StatusCode::TOO_MANY_REQUESTS, "911\n").into_response();
+    }
+
     // Validate hostname is FQDN
     if !params.hostname.contains('.') {
         return (StatusCode::BAD_REQUEST, "notfqdn\n").into_response();

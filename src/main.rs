@@ -41,6 +41,7 @@ mod dns_server;
 #[cfg(test)]
 mod integration_tests;
 mod provider;
+mod rate_limit;
 mod reconciler;
 mod storage;
 mod telemetry;
@@ -320,7 +321,7 @@ async fn init_backends(config: &Config, metrics: Metrics) -> Result<Vec<Arc<dyn 
 }
 
 /// Run the long-running service: API server, mirror polling, and reconciliation loop.
-#[allow(clippy::too_many_arguments)] // Service entrypoint wiring all components together
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)] // Service entrypoint wiring all components together
 async fn run_service(
     config: &Config,
     providers: Vec<Arc<dyn Provider>>,
@@ -340,6 +341,29 @@ async fn run_service(
     // Clone what we need before dynamic_provider is consumed by AppState.
     let dynamic_for_dns = dynamic_provider.as_ref().map(Arc::clone);
 
+    // Build rate limiter from config (global default + per-client overrides).
+    let rate_limiter = config.rate_limit.as_ref().map(|global| {
+        let mut client_overrides = std::collections::HashMap::new();
+        if let Some(ref acme) = config.providers.acme {
+            for (name, client) in &acme.clients {
+                if let Some(ref rl) = client.rate_limit {
+                    client_overrides.insert(name.clone(), *rl);
+                }
+            }
+        }
+        if let Some(ref dynamic) = config.providers.dynamic {
+            for (name, client) in &dynamic.clients {
+                if let Some(ref rl) = client.rate_limit {
+                    client_overrides.insert(name.clone(), *rl);
+                }
+            }
+        }
+        Arc::new(rate_limit::RateLimiterRegistry::new(
+            *global,
+            &client_overrides,
+        ))
+    });
+
     let state = Arc::new(AppState {
         acme_provider,
         dynamic_provider,
@@ -349,6 +373,7 @@ async fn run_service(
         backends: backends.clone(),
         reconcile_notify: Arc::clone(&reconcile_notify),
         metrics,
+        rate_limiter: rate_limiter.clone(),
     });
 
     let dns_metrics = state.metrics.clone();
@@ -373,6 +398,7 @@ async fn run_service(
             backends.clone(),
             Arc::clone(&reconcile_notify),
             dns_metrics,
+            rate_limiter,
         )
         .await?;
         tokio::spawn(dns_server.run());

@@ -81,6 +81,7 @@ async fn test_static_provider_idempotent_reconciliation() {
                     DynamicClientConfig {
                         allowed_domains: vec!["*.example.com".to_string()],
                         allowed_zones: vec!["example.com".to_string()],
+                        rate_limit: None,
                     },
                 )]),
             },
@@ -129,6 +130,7 @@ async fn test_acme_challenge_lifecycle() {
                     "webserver".to_string(),
                     AcmeClientConfig {
                         allowed_domains: vec!["*.example.com".to_string()],
+                        rate_limit: None,
                     },
                 )]),
             },
@@ -182,6 +184,7 @@ async fn test_dynamic_dns_lifecycle() {
                     DynamicClientConfig {
                         allowed_domains: vec!["*.example.com".to_string()],
                         allowed_zones: vec!["example.com".to_string()],
+                        rate_limit: None,
                     },
                 )]),
             },
@@ -259,6 +262,7 @@ async fn test_multi_provider_merge() {
                     DynamicClientConfig {
                         allowed_domains: vec!["*.example.com".to_string()],
                         allowed_zones: vec!["example.com".to_string()],
+                        rate_limit: None,
                     },
                 )]),
             },
