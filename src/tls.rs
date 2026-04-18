@@ -38,3 +38,93 @@ pub(crate) fn load_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor> {
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::TlsConfig;
+
+    /// Write `content` to a temp path unique to this test run and return the path.
+    fn write_temp(label: &str, content: &[u8]) -> String {
+        let path = format!("/tmp/herald-tls-test-{}-{label}", std::process::id());
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_missing_cert_file_returns_error() {
+        let config = TlsConfig {
+            cert_file: "/tmp/herald-tls-nonexistent-cert-file-xyz".to_string(),
+            key_file: "/tmp/herald-tls-nonexistent-key-file-xyz".to_string(),
+        };
+        let err = load_tls_acceptor(&config)
+            .err()
+            .expect("expected an error for missing cert file");
+        assert!(
+            err.to_string().contains("cert"),
+            "error should mention cert file, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_empty_cert_file_returns_error() {
+        let cert_path = write_temp("empty-cert", b"");
+        let key_path = format!("/tmp/herald-tls-nonexistent-key-{}", std::process::id());
+        let config = TlsConfig {
+            cert_file: cert_path.clone(),
+            key_file: key_path,
+        };
+        let err = load_tls_acceptor(&config)
+            .err()
+            .expect("expected an error for empty cert file")
+            .to_string();
+        assert!(
+            err.contains("no certificates found"),
+            "expected 'no certificates found', got: {err}"
+        );
+        std::fs::remove_file(&cert_path).ok();
+    }
+
+    #[test]
+    fn test_invalid_pem_cert_returns_error() {
+        // A PEM block with invalid base64 in the body causes a parse error.
+        let bad_pem = b"-----BEGIN CERTIFICATE-----\n!!!notbase64!!!\n-----END CERTIFICATE-----\n";
+        let cert_path = write_temp("invalid-cert", bad_pem);
+        let key_path = format!("/tmp/herald-tls-nonexistent-key2-{}", std::process::id());
+        let config = TlsConfig {
+            cert_file: cert_path.clone(),
+            key_file: key_path,
+        };
+        let err = load_tls_acceptor(&config)
+            .err()
+            .expect("expected an error for invalid PEM")
+            .to_string();
+        assert!(
+            err.contains("PEM") || err.contains("cert") || err.contains("parse"),
+            "expected a PEM/cert/parse error, got: {err}"
+        );
+        std::fs::remove_file(&cert_path).ok();
+    }
+
+    #[test]
+    fn test_no_pem_blocks_in_cert_file_returns_error() {
+        // A PEM file with no recognisable cert blocks — same "no certificates found" path.
+        // Testing the key-missing path would need a real cert (requires rcgen); instead we
+        // verify the empty-body path reaches the right error message.
+        let no_cert_pem = b"# plain text, no PEM blocks\n";
+        let cert_path = write_temp("no-blocks-cert", no_cert_pem);
+        let config = TlsConfig {
+            cert_file: cert_path.clone(),
+            key_file: "/tmp/herald-tls-nonexistent-key3".to_string(),
+        };
+        let err = load_tls_acceptor(&config)
+            .err()
+            .expect("expected an error for no cert blocks")
+            .to_string();
+        assert!(
+            err.contains("no certificates found"),
+            "expected 'no certificates found', got: {err}"
+        );
+        std::fs::remove_file(&cert_path).ok();
+    }
+}

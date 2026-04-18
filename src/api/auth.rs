@@ -96,3 +96,137 @@ pub(super) fn parse_basic_auth(headers: &axum::http::HeaderMap) -> Option<(Strin
 
     Some((username, password))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::http::HeaderMap;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
+
+    /// Build an `AppState` that has a token index but nothing else wired up.
+    fn make_state(tokens: HashMap<String, String>) -> super::super::AppState {
+        use crate::reconciler::Reconciler;
+        use crate::telemetry::Metrics;
+        super::super::AppState {
+            acme_provider: None,
+            dynamic_provider: None,
+            token_index: super::super::TokenIndex::new(tokens),
+            providers: vec![],
+            reconciler: Arc::new(Reconciler::new(false, Metrics::noop())),
+            backends: vec![],
+            reconcile_notify: Arc::new(Notify::new()),
+            metrics: Metrics::noop(),
+            rate_limiter: None,
+        }
+    }
+
+    fn basic_auth_header(user: &str, pass: &str) -> HeaderMap {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(format!("{user}:{pass}"));
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", format!("Basic {encoded}").parse().unwrap());
+        headers
+    }
+
+    // ── authenticate() ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_authenticate_valid_bearer_token() {
+        let state = make_state(HashMap::from([(
+            "alice".to_string(),
+            "secret-token".to_string(),
+        )]));
+        let result = authenticate(&state, Some("Bearer secret-token"));
+        assert_eq!(result.unwrap(), "alice");
+    }
+
+    #[test]
+    fn test_authenticate_missing_header_is_unauthorized() {
+        let state = make_state(HashMap::new());
+        assert!(matches!(
+            authenticate(&state, None),
+            Err(ApiError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn test_authenticate_non_bearer_scheme_is_unauthorized() {
+        let state = make_state(HashMap::new());
+        // Basic auth header should not be accepted by bearer authenticate()
+        assert!(matches!(
+            authenticate(&state, Some("Basic dXNlcjpwYXNz")),
+            Err(ApiError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn test_authenticate_wrong_token_is_unauthorized() {
+        let state = make_state(HashMap::from([(
+            "alice".to_string(),
+            "correct-token".to_string(),
+        )]));
+        assert!(matches!(
+            authenticate(&state, Some("Bearer wrong-token")),
+            Err(ApiError::Unauthorized)
+        ));
+    }
+
+    #[test]
+    fn test_authenticate_empty_bearer_value_is_unauthorized() {
+        let state = make_state(HashMap::new());
+        // "Bearer " followed by nothing is still parsed as an empty string token
+        assert!(matches!(
+            authenticate(&state, Some("Bearer ")),
+            Err(ApiError::Unauthorized)
+        ));
+    }
+
+    // ── parse_basic_auth() ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_parse_basic_auth_valid() {
+        let headers = basic_auth_header("myuser", "mypassword");
+        let (user, pass) = parse_basic_auth(&headers).unwrap();
+        assert_eq!(user, "myuser");
+        assert_eq!(pass, "mypassword");
+    }
+
+    #[test]
+    fn test_parse_basic_auth_password_with_colons() {
+        // Only the first colon is the username/password separator
+        let headers = basic_auth_header("user", "pass:with:colons");
+        let (user, pass) = parse_basic_auth(&headers).unwrap();
+        assert_eq!(user, "user");
+        assert_eq!(pass, "pass:with:colons");
+    }
+
+    #[test]
+    fn test_parse_basic_auth_missing_header_returns_none() {
+        assert!(parse_basic_auth(&HeaderMap::new()).is_none());
+    }
+
+    #[test]
+    fn test_parse_basic_auth_bearer_scheme_returns_none() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer sometoken".parse().unwrap());
+        assert!(parse_basic_auth(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_basic_auth_invalid_base64_returns_none() {
+        let mut headers = HeaderMap::new();
+        // '!' is not in the base64 alphabet, so this should fail to decode
+        headers.insert("authorization", "Basic !!!notvalid!!!".parse().unwrap());
+        assert!(parse_basic_auth(&headers).is_none());
+    }
+
+    #[test]
+    fn test_parse_basic_auth_no_colon_returns_none() {
+        let mut headers = HeaderMap::new();
+        let encoded = base64::engine::general_purpose::STANDARD.encode("nocolon");
+        headers.insert("authorization", format!("Basic {encoded}").parse().unwrap());
+        // splitn(2, ':') on "nocolon" yields only one part, so password is None
+        assert!(parse_basic_auth(&headers).is_none());
+    }
+}

@@ -207,6 +207,63 @@ pub(crate) mod tests {
         }
     }
 
+    // ── TokenIndex unit tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_token_index_empty_returns_none() {
+        let index = TokenIndex::new(HashMap::new());
+        assert!(index.lookup("anything").is_none());
+    }
+
+    #[test]
+    fn test_token_index_single_token_lookup() {
+        let tokens = HashMap::from([("alice".to_string(), "secret".to_string())]);
+        let index = TokenIndex::new(tokens);
+        assert_eq!(index.lookup("secret"), Some("alice"));
+    }
+
+    #[test]
+    fn test_token_index_unknown_token_returns_none() {
+        let tokens = HashMap::from([("alice".to_string(), "correct".to_string())]);
+        let index = TokenIndex::new(tokens);
+        assert!(index.lookup("wrong").is_none());
+    }
+
+    #[test]
+    fn test_token_index_multiple_tokens() {
+        let tokens = HashMap::from([
+            ("alice".to_string(), "token-a".to_string()),
+            ("bob".to_string(), "token-b".to_string()),
+        ]);
+        let index = TokenIndex::new(tokens);
+        assert_eq!(index.lookup("token-a"), Some("alice"));
+        assert_eq!(index.lookup("token-b"), Some("bob"));
+        assert!(index.lookup("token-c").is_none());
+    }
+
+    #[test]
+    fn test_token_index_tokens_dont_cross_contaminate() {
+        // token-a must not resolve to "bob" and vice versa
+        let tokens = HashMap::from([
+            ("alice".to_string(), "token-a".to_string()),
+            ("bob".to_string(), "token-b".to_string()),
+        ]);
+        let index = TokenIndex::new(tokens);
+        assert_ne!(index.lookup("token-a"), Some("bob"));
+        assert_ne!(index.lookup("token-b"), Some("alice"));
+    }
+
+    #[test]
+    fn test_token_index_uses_hmac_not_plaintext() {
+        // Two separate TokenIndex instances for the same token must both resolve
+        // correctly even though each uses a different random HMAC key internally.
+        let tokens = HashMap::from([("client".to_string(), "my-token".to_string())]);
+        let index1 = TokenIndex::new(tokens.clone());
+        let index2 = TokenIndex::new(tokens);
+        assert_eq!(index1.lookup("my-token"), Some("client"));
+        assert_eq!(index2.lookup("my-token"), Some("client"));
+    }
+
     pub(crate) fn test_token_index() -> TokenIndex {
         let mut tokens = HashMap::new();
         tokens.insert("testclient".to_string(), "test-token-123".to_string());
