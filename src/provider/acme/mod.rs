@@ -120,12 +120,7 @@ impl AcmeProvider {
             client: client.to_string(),
         };
 
-        // Update in-memory state
-        let mut challenges = self.challenges.write().await;
-        challenges.insert(fqdn.to_string(), entry.clone());
-        drop(challenges); // Release lock before I/O
-
-        // Persist to database (blocking I/O)
+        // Persist to database first — the durable store is the source of truth.
         if let Some(ref storage) = self.storage {
             let storage = Arc::clone(storage);
             let fqdn_owned = fqdn.to_string();
@@ -137,6 +132,11 @@ impl AcmeProvider {
             .await
             .context("database persistence task panicked")??;
         }
+
+        // Update in-memory state only after persistence succeeds
+        let mut challenges = self.challenges.write().await;
+        challenges.insert(fqdn.to_string(), entry);
+        drop(challenges);
 
         tracing::info!(client, fqdn, "ACME challenge set");
         Ok(())
@@ -172,20 +172,20 @@ impl AcmeProvider {
     async fn clear_challenge_inner(&self, client: &str, fqdn: &str) -> Result<()> {
         self.check_client_permission(client, fqdn)?;
 
-        // Check ownership and delete from memory
-        let mut challenges = self.challenges.write().await;
-        if let Some(existing) = challenges.get(fqdn) {
-            if existing.client != client {
+        // Check ownership (requires reading in-memory state)
+        {
+            let challenges = self.challenges.read().await;
+            if let Some(existing) = challenges.get(fqdn)
+                && existing.client != client
+            {
                 anyhow::bail!(
                     "client {client} cannot clear challenge set by {}",
                     existing.client
                 );
             }
-            challenges.remove(fqdn);
         }
-        drop(challenges); // Release lock before I/O
 
-        // Persist deletion to database (blocking I/O)
+        // Persist deletion to database first
         if let Some(ref storage) = self.storage {
             let storage = Arc::clone(storage);
             let fqdn_owned = fqdn.to_string();
@@ -196,6 +196,11 @@ impl AcmeProvider {
             .await
             .context("database persistence task panicked")??;
         }
+
+        // Remove from memory only after persistence succeeds
+        let mut challenges = self.challenges.write().await;
+        challenges.remove(fqdn);
+        drop(challenges);
 
         tracing::info!(client, fqdn, "ACME challenge cleared");
         Ok(())

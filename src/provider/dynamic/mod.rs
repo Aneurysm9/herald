@@ -173,12 +173,9 @@ impl DynamicProvider {
             client: client.to_string(),
         };
 
-        // Update in-memory state
-        let mut records = self.records.write().await;
-        records.insert(key.clone(), entry.clone());
-        drop(records); // Release lock before I/O
-
-        // Persist to database (blocking I/O)
+        // Persist to database first — the durable store is the source of truth.
+        // If the process crashes after this but before the memory update, the
+        // record is recovered from the database on restart.
         if let Some(ref storage) = self.storage {
             let storage = Arc::clone(storage);
             let key_clone = key.clone();
@@ -190,6 +187,11 @@ impl DynamicProvider {
             .await
             .context("database persistence task panicked")??;
         }
+
+        // Update in-memory state only after persistence succeeds
+        let mut records = self.records.write().await;
+        records.insert(key, entry);
+        drop(records);
 
         tracing::info!(client, zone, name, record_type, "dynamic record set");
         Ok(())
@@ -246,20 +248,20 @@ impl DynamicProvider {
             record_type: record_type.to_string(),
         };
 
-        // Check ownership and delete from memory
-        let mut records = self.records.write().await;
-        if let Some(existing) = records.get(&key) {
-            if existing.client != client {
+        // Check ownership (requires reading in-memory state)
+        {
+            let records = self.records.read().await;
+            if let Some(existing) = records.get(&key)
+                && existing.client != client
+            {
                 anyhow::bail!(
                     "client {client} cannot delete record owned by {}",
                     existing.client
                 );
             }
-            records.remove(&key);
         }
-        drop(records); // Release lock before I/O
 
-        // Persist deletion to database (blocking I/O)
+        // Persist deletion to database first
         if let Some(ref storage) = self.storage {
             let storage = Arc::clone(storage);
             let key_clone = key.clone();
@@ -270,6 +272,11 @@ impl DynamicProvider {
             .await
             .context("database persistence task panicked")??;
         }
+
+        // Remove from memory only after persistence succeeds
+        let mut records = self.records.write().await;
+        records.remove(&key);
+        drop(records);
 
         tracing::info!(client, zone, name, record_type, "dynamic record deleted");
         Ok(())
@@ -292,29 +299,36 @@ impl DynamicProvider {
     ) -> Result<()> {
         self.check_permission(client, zone, name)?;
 
-        let mut records = self.records.write().await;
-        let keys_to_delete: Vec<RecordKey> = records
-            .iter()
-            .filter(|(k, v)| k.zone == zone && k.name == name && v.client == client)
-            .map(|(k, _)| k.clone())
-            .collect();
+        // Collect keys to delete (requires read lock)
+        let keys_to_delete: Vec<RecordKey> = {
+            let records = self.records.read().await;
+            records
+                .iter()
+                .filter(|(k, v)| k.zone == zone && k.name == name && v.client == client)
+                .map(|(k, _)| k.clone())
+                .collect()
+        };
 
-        for key in &keys_to_delete {
-            records.remove(key);
-        }
-        drop(records);
-
+        // Persist deletions to database first
         if let Some(ref storage) = self.storage {
-            for key in keys_to_delete {
+            for key in &keys_to_delete {
                 let storage = Arc::clone(storage);
+                let key_clone = key.clone();
                 tokio::task::spawn_blocking(move || {
                     let storage = storage.blocking_lock();
-                    storage.delete(&key)
+                    storage.delete(&key_clone)
                 })
                 .await
                 .context("database persistence task panicked")??;
             }
         }
+
+        // Remove from memory only after persistence succeeds
+        let mut records = self.records.write().await;
+        for key in &keys_to_delete {
+            records.remove(key);
+        }
+        drop(records);
 
         tracing::info!(client, zone, name, "dynamic records deleted (all types)");
         Ok(())
