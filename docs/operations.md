@@ -855,10 +855,12 @@ Incoming DNS UPDATE records are subject to the same permission scoping as the HT
 - The derived zone must be in `allowed_zones`
 - Only records in configured backend zones can be managed
 
+### Prerequisite evaluation
+
+The DNS UPDATE receiver evaluates all five RFC 2136 §3.2 prerequisite forms against actual backend state. Prerequisites are checked using targeted per-name queries — for the RFC 2136 backend, this queries the authoritative server directly rather than local state.
+
 ### Limitations
 
-- Prerequisite section (RFC 2136 §3.2) is parsed but not evaluated — updates always proceed if TSIG authentication succeeds
-- `TYPE=ANY` delete-all (delete all records for a name) is not yet implemented
 - Responses are not TSIG-signed
 
 ## Multi-Zone Setup

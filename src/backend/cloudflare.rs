@@ -242,6 +242,65 @@ impl CloudflareBackend {
         Ok(all_records)
     }
 
+    /// Fetch records for a specific name from the Cloudflare API.
+    ///
+    /// Uses the `name` query parameter to filter server-side, avoiding a full
+    /// zone fetch. A single name typically has only a handful of records.
+    async fn get_records_by_name_inner(
+        &self,
+        name: &str,
+        zone: &str,
+    ) -> Result<Vec<ExistingRecord>> {
+        let url = self.records_url_for_zone(zone)?;
+
+        let resp: CfListResponse<CfDnsRecord> = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .query(&[("name", name)])
+            .send()
+            .await?
+            .json()
+            .await?;
+
+        if !resp.success {
+            anyhow::bail!(
+                "Cloudflare API error querying {name} in zone {zone}: {:?}",
+                resp.errors
+            );
+        }
+
+        let mut records = Vec::new();
+        for cf_rec in &resp.result {
+            match RecordValue::parse(&cf_rec.r#type, &cf_rec.content) {
+                Ok(value) => {
+                    records.push(ExistingRecord {
+                        id: cf_rec.id.clone(),
+                        record: EnrichedRecord {
+                            zone: zone.to_string(),
+                            name: cf_rec.name.clone(),
+                            value,
+                            ttl: cf_rec.ttl,
+                        },
+                        managed: cf_rec
+                            .comment
+                            .as_deref()
+                            .is_some_and(|c| c.contains(MANAGED_COMMENT)),
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        name = %cf_rec.name,
+                        record_type = %cf_rec.r#type,
+                        error = %e,
+                        "skipping Cloudflare record with unparseable type/value"
+                    );
+                }
+            }
+        }
+        Ok(records)
+    }
+
     /// Apply a change to the Cloudflare API.
     ///
     /// Dispatches to the appropriate HTTP method (POST for create, PUT for
@@ -369,6 +428,14 @@ impl Backend for CloudflareBackend {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ExistingRecord>>> + Send + '_>> {
         Box::pin(self.get_records_inner())
+    }
+
+    fn get_records_by_name<'a>(
+        &'a self,
+        name: &'a str,
+        zone: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ExistingRecord>>> + Send + 'a>> {
+        Box::pin(self.get_records_by_name_inner(name, zone))
     }
 
     fn apply_change<'a>(
@@ -790,5 +857,57 @@ mod tests {
             err_msg.contains("DNS Validation Error"),
             "expected error message, got: {err_msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_records_by_name() {
+        let server = MockServer::start().await;
+        let backend = test_backend(&server);
+
+        Mock::given(method("GET"))
+            .and(path("/zones/zone-123/dns_records"))
+            .and(bearer_token("test-token"))
+            .and(query_param("name", "www.example.com"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "success": true,
+                "errors": [],
+                "result": [{
+                    "id": "rec-001",
+                    "type": "A",
+                    "name": "www.example.com",
+                    "content": "203.0.113.1",
+                    "ttl": 300,
+                    "comment": "managed-by: herald"
+                }, {
+                    "id": "rec-002",
+                    "type": "AAAA",
+                    "name": "www.example.com",
+                    "content": "2001:db8::1",
+                    "ttl": 300,
+                    "comment": null
+                }],
+                "result_info": null
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let records = backend
+            .get_records_by_name_inner("www.example.com", "example.com")
+            .await
+            .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].record.name, "www.example.com");
+        assert_eq!(
+            records[0].record.value,
+            RecordValue::A("203.0.113.1".parse().unwrap())
+        );
+        assert!(records[0].managed);
+        assert_eq!(
+            records[1].record.value,
+            RecordValue::AAAA("2001:db8::1".parse().unwrap())
+        );
+        assert!(!records[1].managed);
     }
 }

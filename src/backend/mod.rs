@@ -54,6 +54,27 @@ pub(crate) trait Backend: Named + Send + Sync {
     fn get_records(&self)
     -> Pin<Box<dyn Future<Output = Result<Vec<ExistingRecord>>> + Send + '_>>;
 
+    /// Fetch records for a specific name from the backend.
+    ///
+    /// Used by the DNS UPDATE receiver to evaluate RFC 2136 prerequisites
+    /// against actual backend state. Returns all record types for the given
+    /// name within the specified zone.
+    ///
+    /// The default implementation filters `get_records()` by name. Backends
+    /// should override this when a more efficient targeted query is available
+    /// (e.g., Cloudflare API `?name=` filter, or direct DNS lookup for
+    /// RFC 2136).
+    fn get_records_by_name<'a>(
+        &'a self,
+        name: &'a str,
+        _zone: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ExistingRecord>>> + Send + 'a>> {
+        Box::pin(async move {
+            let all = self.get_records().await?;
+            Ok(all.into_iter().filter(|r| r.record.name == name).collect())
+        })
+    }
+
     /// Apply a single change.
     fn apply_change<'a>(
         &'a self,

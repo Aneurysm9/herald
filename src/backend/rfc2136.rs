@@ -501,6 +501,63 @@ impl Rfc2136Backend {
         Ok(())
     }
 
+    /// Query the authoritative server for all records at a given name.
+    ///
+    /// Tries `RecordType::ANY` first; if the server returns nothing (many
+    /// servers block ANY per RFC 8482), falls back to querying each common
+    /// type individually.
+    async fn get_records_by_name_inner(
+        &self,
+        name: &str,
+        zone: &str,
+    ) -> Result<Vec<ExistingRecord>> {
+        use hickory_proto::rr::RecordType;
+
+        // Try ANY first — returns all types in one round-trip if supported.
+        let mut answers = self.query_record(name, RecordType::ANY).await?;
+
+        // Fallback: many servers block ANY (RFC 8482). Query common types.
+        if answers.is_empty() {
+            let types = [
+                RecordType::A,
+                RecordType::AAAA,
+                RecordType::CNAME,
+                RecordType::TXT,
+                RecordType::MX,
+                RecordType::NS,
+            ];
+            for rtype in types {
+                let mut results = self.query_record(name, rtype).await?;
+                answers.append(&mut results);
+            }
+        }
+
+        let mut records = Vec::new();
+        for rdata in &answers {
+            match RecordValue::try_from(rdata) {
+                Ok(value) => {
+                    records.push(ExistingRecord {
+                        id: String::new(),
+                        record: EnrichedRecord {
+                            zone: zone.to_string(),
+                            name: name.to_string(),
+                            value,
+                            ttl: 0, // TTL not relevant for prerequisite evaluation
+                        },
+                        managed: false, // unknown — not from SQLite
+                    });
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        name, rdata = ?rdata, error = %e,
+                        "skipping unsupported RData type in name query"
+                    );
+                }
+            }
+        }
+        Ok(records)
+    }
+
     async fn get_records_with_metrics(&self) -> Result<Vec<ExistingRecord>> {
         let start = Instant::now();
         let result = self.get_records_inner().await;
@@ -626,6 +683,14 @@ impl Backend for Rfc2136Backend {
         &self,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<ExistingRecord>>> + Send + '_>> {
         Box::pin(self.get_records_with_metrics())
+    }
+
+    fn get_records_by_name<'a>(
+        &'a self,
+        name: &'a str,
+        zone: &'a str,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<ExistingRecord>>> + Send + 'a>> {
+        Box::pin(self.get_records_by_name_inner(name, zone))
     }
 
     fn apply_change<'a>(
