@@ -413,6 +413,176 @@ fn default_reconciler_interval() -> String {
     "1m".to_string()
 }
 
+// ── Validation ───────────────────────────────────────────────────────────────
+//
+// Each config type validates its own invariants. `Config::validate()` composes
+// them, threading context (e.g., known backend zones) where cross-cutting
+// checks are needed.
+
+impl Config {
+    /// Validate the configuration for internal consistency.
+    ///
+    /// Called at startup before initializing any backends or providers.
+    /// Delegates to per-type validation methods and checks cross-cutting
+    /// constraints (e.g., provider zones must reference backend zones).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error describing the first invalid configuration found.
+    pub(crate) fn validate(&self) -> Result<()> {
+        let backend_zones = self.backends.validate()?;
+        self.providers.validate(&backend_zones)?;
+        if let Some(ref dns) = self.dns_server {
+            dns.validate(&self.providers)?;
+        }
+        Ok(())
+    }
+}
+
+impl CloudflareConfig {
+    fn validate(&self, index: usize) -> Result<Vec<String>> {
+        let desc = self
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("cloudflare[{index}]"));
+        if self.zones.is_empty() {
+            anyhow::bail!("backend {desc} has no zones configured");
+        }
+        Ok(self.zones.clone())
+    }
+}
+
+impl TechnitiumConfig {
+    fn validate(&self, index: usize) -> Result<Vec<String>> {
+        let desc = self
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("technitium[{index}]"));
+        if self.zones.is_empty() {
+            anyhow::bail!("backend {desc} has no zones configured");
+        }
+        Ok(self.zones.clone())
+    }
+}
+
+impl Rfc2136BackendConfig {
+    fn validate(&self, index: usize) -> Result<Vec<String>> {
+        let desc = self
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("rfc2136[{index}]"));
+        if self.zones.is_empty() {
+            anyhow::bail!("backend {desc} has no zones configured");
+        }
+        if self.tsig_key_file.is_some() != self.tsig_key_name.is_some() {
+            anyhow::bail!(
+                "backend {desc}: tsig_key_file and tsig_key_name must both be set or both omitted"
+            );
+        }
+        Ok(self.zones.clone())
+    }
+}
+
+impl BackendsConfig {
+    /// Validate all backends and return the set of all configured zone names.
+    ///
+    /// Checks that each backend has at least one zone and that no zone appears
+    /// in more than one backend.
+    fn validate(&self) -> Result<std::collections::HashSet<String>> {
+        let mut seen: HashMap<String, String> = HashMap::new(); // zone → backend desc
+
+        for (i, cf) in self.cloudflare.iter().enumerate() {
+            let desc = cf
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("cloudflare[{i}]"));
+            for zone in cf.validate(i)? {
+                if let Some(first) = seen.get(&zone) {
+                    anyhow::bail!("zone '{zone}' appears in both {first} and {desc}");
+                }
+                seen.insert(zone, desc.clone());
+            }
+        }
+        for (i, tech) in self.technitium.iter().enumerate() {
+            let desc = tech
+                .name
+                .clone()
+                .unwrap_or_else(|| format!("technitium[{i}]"));
+            for zone in tech.validate(i)? {
+                if let Some(first) = seen.get(&zone) {
+                    anyhow::bail!("zone '{zone}' appears in both {first} and {desc}");
+                }
+                seen.insert(zone, desc.clone());
+            }
+        }
+        for (i, rfc) in self.rfc2136.iter().enumerate() {
+            let desc = rfc.name.clone().unwrap_or_else(|| format!("rfc2136[{i}]"));
+            for zone in rfc.validate(i)? {
+                if let Some(first) = seen.get(&zone) {
+                    anyhow::bail!("zone '{zone}' appears in both {first} and {desc}");
+                }
+                seen.insert(zone, desc.clone());
+            }
+        }
+
+        Ok(seen.into_keys().collect())
+    }
+}
+
+impl DynamicProviderConfig {
+    /// Validate that all client `allowed_zones` reference zones in some backend.
+    fn validate(&self, backend_zones: &std::collections::HashSet<String>) -> Result<()> {
+        for (client_name, client_config) in &self.clients {
+            for zone in &client_config.allowed_zones {
+                if !backend_zones.contains(zone) {
+                    anyhow::bail!(
+                        "dynamic client '{client_name}' references zone '{zone}' \
+                         which is not configured in any backend"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl ProvidersConfig {
+    /// Validate providers against the set of known backend zones.
+    fn validate(&self, backend_zones: &std::collections::HashSet<String>) -> Result<()> {
+        if let Some(ref dynamic) = self.dynamic {
+            dynamic.validate(backend_zones)?;
+        }
+        Ok(())
+    }
+}
+
+impl DnsServerConfig {
+    /// Validate DNS server config against the providers config.
+    ///
+    /// Requires the dynamic provider to be configured, and all TSIG key
+    /// `client` fields must reference existing dynamic provider clients.
+    fn validate(&self, providers: &ProvidersConfig) -> Result<()> {
+        let Some(ref dynamic) = providers.dynamic else {
+            anyhow::bail!(
+                "dns_server is configured but providers.dynamic is not — \
+                 the DNS UPDATE receiver requires the dynamic provider"
+            );
+        };
+
+        for key in &self.tsig_keys {
+            if !dynamic.clients.contains_key(&key.client) {
+                anyhow::bail!(
+                    "dns_server TSIG key '{}' maps to client '{}' \
+                     which is not defined in providers.dynamic.clients",
+                    key.key_name,
+                    key.client
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Load configuration from a YAML file with environment variable overrides.
 ///
 /// Configuration is loaded in layers (later layers override earlier ones):
@@ -438,4 +608,150 @@ pub(crate) fn load(path: &str) -> Result<Config> {
 
     tracing::info!("configuration loaded from {path}");
     Ok(config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal valid Config for testing. Each test overrides
+    /// the specific field it wants to invalidate.
+    fn valid_config() -> Config {
+        Config {
+            listen: "[::]:8443".to_string(),
+            tls: TlsConfig {
+                cert_file: "/tmp/cert.pem".to_string(),
+                key_file: "/tmp/key.pem".to_string(),
+            },
+            backends: BackendsConfig {
+                cloudflare: vec![CloudflareConfig {
+                    name: Some("cf-test".to_string()),
+                    zones: vec!["example.com".to_string()],
+                    token_file: "/tmp/token".to_string(),
+                }],
+                technitium: vec![],
+                rfc2136: vec![],
+            },
+            providers: ProvidersConfig::default(),
+            reconciler: ReconcilerConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            tokens_file: None,
+            state_dir: "/tmp/herald".to_string(),
+            dns_server: None,
+        }
+    }
+
+    #[test]
+    fn test_validate_valid_config_passes() {
+        let config = valid_config();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_empty_zones_rejected() {
+        let mut config = valid_config();
+        config.backends.cloudflare[0].zones.clear();
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("no zones configured"),
+            "expected 'no zones configured', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_duplicate_zones_rejected() {
+        let mut config = valid_config();
+        config.backends.technitium.push(TechnitiumConfig {
+            name: Some("tech-test".to_string()),
+            zones: vec!["example.com".to_string()], // same zone as cloudflare
+            url: "http://localhost:5380".to_string(),
+            token_file: "/tmp/token".to_string(),
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("example.com"),
+            "expected zone name in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_dynamic_allowed_zone_must_exist() {
+        let mut config = valid_config();
+        config.providers.dynamic = Some(DynamicProviderConfig {
+            clients: HashMap::from([(
+                "test-client".to_string(),
+                DynamicClientConfig {
+                    allowed_domains: vec!["*.example.com".to_string()],
+                    allowed_zones: vec!["nonexistent.org".to_string()],
+                },
+            )]),
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("nonexistent.org"),
+            "expected zone name in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_dns_server_requires_dynamic() {
+        let mut config = valid_config();
+        config.dns_server = Some(DnsServerConfig {
+            listen: "[::]:5353".to_string(),
+            tsig_keys: vec![],
+        });
+        // No dynamic provider
+        config.providers.dynamic = None;
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("dynamic"),
+            "expected mention of dynamic provider, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_tsig_key_client_must_exist() {
+        let mut config = valid_config();
+        config.providers.dynamic = Some(DynamicProviderConfig {
+            clients: HashMap::from([(
+                "real-client".to_string(),
+                DynamicClientConfig {
+                    allowed_domains: vec!["*.example.com".to_string()],
+                    allowed_zones: vec!["example.com".to_string()],
+                },
+            )]),
+        });
+        config.dns_server = Some(DnsServerConfig {
+            listen: "[::]:5353".to_string(),
+            tsig_keys: vec![TsigKeyConfig {
+                key_name: "test.example.com".to_string(),
+                algorithm: "hmac-sha256".to_string(),
+                secret_file: "/tmp/secret".to_string(),
+                client: "ghost-client".to_string(), // not in dynamic.clients
+            }],
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("ghost-client"),
+            "expected client name in error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rfc2136_tsig_partial_rejected() {
+        let mut config = valid_config();
+        config.backends.cloudflare.clear();
+        config.backends.rfc2136.push(Rfc2136BackendConfig {
+            name: Some("bind".to_string()),
+            zones: vec!["example.com".to_string()],
+            primary_nameserver: "ns1.example.com:53".to_string(),
+            tsig_key_file: Some("/tmp/key".to_string()),
+            tsig_key_name: None, // missing key_name
+        });
+        let err = config.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("tsig_key_file") && err.contains("tsig_key_name"),
+            "expected both tsig fields mentioned, got: {err}"
+        );
+    }
 }
