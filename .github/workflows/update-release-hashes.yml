@@ -52,6 +52,8 @@ jobs:
             }' > nix/release.json
 
       - name: Commit and push
+        env:
+          VERSION: ${{ steps.tag.outputs.tag }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
