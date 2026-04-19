@@ -5,13 +5,15 @@
 
 use crate::backend::{Backend, Change};
 use crate::config::{
-    AcmeClientConfig, AcmeProviderConfig, DynamicClientConfig, DynamicProviderConfig,
+    AcmeClientConfig, AcmeProviderConfig, DynamicClientConfig, DynamicProviderConfig, MirrorMatch,
+    MirrorProviderConfig, MirrorRule, MirrorSource, MirrorTransform, MirrorTransformKind,
     StaticProviderConfig, StaticRecord,
 };
-use crate::provider::Provider;
 use crate::provider::acme::AcmeProvider;
 use crate::provider::dynamic::DynamicProvider;
+use crate::provider::mirror::MirrorProvider;
 use crate::provider::r#static::StaticProvider;
+use crate::provider::{DesiredRecord, Provider, RecordValue};
 use crate::reconciler::Reconciler;
 use crate::telemetry::Metrics;
 use crate::testing::FakeBackend;
@@ -392,4 +394,242 @@ async fn test_multi_backend_zone_routing() {
         Change::Create(r) => assert_eq!(r.name, "www.example.org"),
         other => panic!("expected Create, got: {other:?}"),
     }
+}
+
+/// Build a mirror config suitable for the integration test.
+///
+/// Uses `type: dns` so no `token_file`/`url` is required; the source is never
+/// actually polled in the test — records are seeded into the cache directly
+/// via `MirrorProvider::set_cache_for_test`.
+fn test_mirror_config(
+    name: Option<&str>,
+    zone: &str,
+    rules: Vec<MirrorRule>,
+) -> MirrorProviderConfig {
+    MirrorProviderConfig {
+        name: name.map(str::to_string),
+        source: MirrorSource {
+            r#type: "dns".to_string(),
+            url: None,
+            zone: zone.to_string(),
+            token_file: None,
+            subdomains: vec![],
+            nameserver: None,
+            tsig_key_name: None,
+        },
+        rules,
+        interval: "5m".to_string(),
+    }
+}
+
+#[tokio::test]
+async fn test_multiple_mirrors_contribute_distinct_records() {
+    // Two independent mirrors with different names, sources, and rule sets
+    // must both reach the reconciler as separate providers and contribute
+    // distinct records to the backend without colliding.
+    let backend_com = FakeBackend::arc_empty("cf", vec!["example.com".to_string()]);
+    let backend_org = FakeBackend::arc_empty("cf-org", vec!["example.org".to_string()]);
+    let backends: Vec<Arc<dyn Backend>> =
+        vec![backend_com.clone() as Arc<dyn Backend>, backend_org.clone()];
+
+    let first_rule = MirrorRule {
+        r#match: MirrorMatch {
+            r#type: Some("AAAA".to_string()),
+            name: None,
+        },
+        transform: MirrorTransform {
+            kind: MirrorTransformKind::Suffix {
+                suffix: "example.com".to_string(),
+            },
+            ttl: Some(600),
+        },
+    };
+    let second_rule = MirrorRule {
+        r#match: MirrorMatch {
+            r#type: None,
+            name: None,
+        },
+        transform: MirrorTransform {
+            kind: MirrorTransformKind::Rename {
+                to: "db.example.org".to_string(),
+            },
+            ttl: None,
+        },
+    };
+
+    let first = Arc::new(
+        MirrorProvider::new(
+            test_mirror_config(
+                Some("internal-dns"),
+                "internal.example.net",
+                vec![first_rule],
+            ),
+            0,
+            Metrics::noop(),
+        )
+        .await
+        .expect("constructing first mirror"),
+    );
+    let second = Arc::new(
+        MirrorProvider::new(
+            test_mirror_config(Some("corp-dns"), "corp.internal", vec![second_rule]),
+            1,
+            Metrics::noop(),
+        )
+        .await
+        .expect("constructing second mirror"),
+    );
+
+    // Seed each mirror's cache directly — the `dns` source isn't actually
+    // reachable in tests, and polling behavior is covered by unit tests.
+    first
+        .set_cache_for_test(vec![DesiredRecord {
+            name: "host1.example.com".to_string(),
+            value: RecordValue::parse("AAAA", "2001:db8::1").unwrap(),
+            ttl: 600,
+        }])
+        .await;
+    second
+        .set_cache_for_test(vec![DesiredRecord {
+            name: "db.example.org".to_string(),
+            value: RecordValue::parse("A", "198.51.100.7").unwrap(),
+            ttl: 300,
+        }])
+        .await;
+
+    let providers: Vec<Arc<dyn Provider>> = vec![first, second];
+    let reconciler = Reconciler::new(false, Metrics::noop());
+    reconciler.reconcile(&providers, &backends).await.unwrap();
+
+    let com_changes = backend_com.take_applied_changes().await;
+    let org_changes = backend_org.take_applied_changes().await;
+
+    assert_eq!(com_changes.len(), 1, "example.com should get host1");
+    assert_eq!(org_changes.len(), 1, "example.org should get db");
+
+    match &com_changes[0] {
+        Change::Create(r) => {
+            assert_eq!(r.name, "host1.example.com");
+            assert_eq!(r.ttl, 600, "per-rule TTL override must survive reconcile");
+        }
+        other => panic!("expected Create, got: {other:?}"),
+    }
+    match &org_changes[0] {
+        Change::Create(r) => {
+            assert_eq!(r.name, "db.example.org");
+            assert_eq!(r.ttl, 300, "default TTL applied when rule omits ttl");
+        }
+        other => panic!("expected Create, got: {other:?}"),
+    }
+}
+
+/// Two mirror instances emit the same FQDN with different values. The
+/// reconciler groups desired records by `(zone, name, type)` and supports
+/// multi-value record sets, so both values should land at the backend rather than
+/// one silently winning over the other. This documents the cross-mirror
+/// merge semantics — operators get multi-value DNS records if they configure
+/// overlapping mirrors, not a collision error.
+#[tokio::test]
+async fn test_same_fqdn_across_mirrors_merges_into_rrset() {
+    let backend = FakeBackend::arc_empty("cf", vec!["example.com".to_string()]);
+    let backends: Vec<Arc<dyn Backend>> = vec![backend.clone()];
+
+    let first = Arc::new(
+        MirrorProvider::new(
+            test_mirror_config(
+                Some("site-a"),
+                "a.internal",
+                vec![MirrorRule {
+                    r#match: MirrorMatch {
+                        r#type: None,
+                        name: None,
+                    },
+                    transform: MirrorTransform {
+                        kind: MirrorTransformKind::Suffix {
+                            suffix: "example.com".to_string(),
+                        },
+                        ttl: None,
+                    },
+                }],
+            ),
+            0,
+            Metrics::noop(),
+        )
+        .await
+        .unwrap(),
+    );
+    let second = Arc::new(
+        MirrorProvider::new(
+            test_mirror_config(
+                Some("site-b"),
+                "b.internal",
+                vec![MirrorRule {
+                    r#match: MirrorMatch {
+                        r#type: None,
+                        name: None,
+                    },
+                    transform: MirrorTransform {
+                        kind: MirrorTransformKind::Suffix {
+                            suffix: "example.com".to_string(),
+                        },
+                        ttl: None,
+                    },
+                }],
+            ),
+            1,
+            Metrics::noop(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    first
+        .set_cache_for_test(vec![DesiredRecord {
+            name: "api.example.com".to_string(),
+            value: RecordValue::parse("A", "203.0.113.1").unwrap(),
+            ttl: 300,
+        }])
+        .await;
+    second
+        .set_cache_for_test(vec![DesiredRecord {
+            name: "api.example.com".to_string(),
+            value: RecordValue::parse("A", "203.0.113.2").unwrap(),
+            ttl: 300,
+        }])
+        .await;
+
+    let providers: Vec<Arc<dyn Provider>> = vec![first, second];
+    let reconciler = Reconciler::new(false, Metrics::noop());
+    reconciler.reconcile(&providers, &backends).await.unwrap();
+
+    let changes = backend.take_applied_changes().await;
+    assert_eq!(
+        changes.len(),
+        2,
+        "both mirror values should be created as a multi-value record set, got: {changes:?}"
+    );
+
+    // Both changes must be `Create` and must share the same (name, type) —
+    // otherwise the count-of-2 assertion would pass trivially even if the
+    // reconciler had emitted two unrelated records instead of a real
+    // multi-value record set at the same FQDN.
+    let mut values: Vec<String> = Vec::new();
+    for change in &changes {
+        let Change::Create(r) = change else {
+            panic!("expected Create, got: {change:?}");
+        };
+        assert_eq!(r.name, "api.example.com", "all Creates must share the FQDN");
+        assert_eq!(
+            r.value.type_str(),
+            "A",
+            "all Creates must share the record type"
+        );
+        values.push(r.value.to_string());
+    }
+    values.sort();
+    assert_eq!(
+        values,
+        vec!["203.0.113.1".to_string(), "203.0.113.2".to_string()],
+        "both values from the two mirrors must land in the record set"
+    );
 }

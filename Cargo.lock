@@ -919,6 +919,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "rand 0.9.4",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",

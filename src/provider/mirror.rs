@@ -2,7 +2,7 @@ use super::{DesiredRecord, Named, Provider, RecordValue};
 use crate::backend::technitium_util::{
     TechnitiumResponse, extract_rdata as extract_technitium_rdata,
 };
-use crate::config::MirrorProviderConfig;
+use crate::config::{MirrorProviderConfig, MirrorTransformKind};
 use crate::telemetry::Metrics;
 use crate::tsig::{self, TSIG_FUDGE};
 use anyhow::{Context, Result};
@@ -18,13 +18,21 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 /// Provider that polls a DNS source and mirrors selected records
 /// with name transformations.
 pub(crate) struct MirrorProvider {
+    /// Instance name used in logs, metrics, and the `Named` trait impl.
+    name: String,
+    /// Parsed polling interval. Carrying this on the provider means the
+    /// polling loop doesn't have to look back into the config by index.
+    interval: Duration,
     config: MirrorProviderConfig,
+    /// Runtime-ready transforms, one per rule in `config.rules`, aligned by
+    /// index. Built once at construction so polling never re-compiles regex.
+    compiled_transforms: Vec<CompiledTransform>,
     /// Cached records from the last poll
     cached_records: Arc<RwLock<Vec<DesiredRecord>>>,
     /// Reusable HTTP client for Technitium API requests
@@ -40,8 +48,21 @@ pub(crate) struct MirrorProvider {
     metrics: Metrics,
 }
 
+/// Default TTL applied to mirrored records when a rule does not specify one.
+const DEFAULT_MIRROR_TTL: u32 = 300;
+
 impl MirrorProvider {
-    pub(crate) async fn new(config: MirrorProviderConfig, metrics: Metrics) -> Result<Self> {
+    pub(crate) async fn new(
+        config: MirrorProviderConfig,
+        index: usize,
+        metrics: Metrics,
+    ) -> Result<Self> {
+        let name = config.display_name(index);
+        // `interval` is parsed here as the single source of truth; a typo
+        // surfaces at startup inside `init_providers`. See the same-policy
+        // note on `CompiledTransform::from_config`.
+        let interval = humantime::parse_duration(&config.interval)
+            .with_context(|| format!("mirror {name}: invalid interval {:?}", config.interval))?;
         // Validate configuration based on source type and prepare type-specific state.
         let mut technitium_token: Option<String> = None;
         let mut tsig_signer: Option<TSigner> = None;
@@ -120,8 +141,23 @@ impl MirrorProvider {
             .context("initializing DNS resolver from system configuration")?
             .build()?;
 
+        // Build the runtime transform for each rule once. This is the single
+        // regex-compile site — validation deliberately does not pre-compile,
+        // so a bad pattern surfaces here at startup inside `init_providers`.
+        let compiled_transforms = config
+            .rules
+            .iter()
+            .map(|rule| {
+                CompiledTransform::from_config(&rule.transform.kind)
+                    .with_context(|| format!("mirror {name}: compiling rule transform"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
         Ok(Self {
+            name,
+            interval,
             config,
+            compiled_transforms,
             cached_records: Arc::new(RwLock::new(Vec::new())),
             client,
             technitium_token,
@@ -146,7 +182,10 @@ impl MirrorProvider {
     ///
     /// Returns an error if the API request fails, the response cannot be parsed,
     /// or the source type is unknown.
-    #[tracing::instrument(skip(self), fields(source_type = %self.config.source.r#type))]
+    #[tracing::instrument(
+        skip(self),
+        fields(mirror = %self.name, source_type = %self.config.source.r#type),
+    )]
     pub(crate) async fn poll(&self) -> Result<()> {
         let start = Instant::now();
 
@@ -154,10 +193,13 @@ impl MirrorProvider {
 
         let elapsed = start.elapsed().as_secs_f64();
         let status = if result.is_ok() { "success" } else { "error" };
+        let mirror_attr = KeyValue::new("mirror", self.name.clone());
         self.metrics
             .mirror_polls
-            .add(1, &[KeyValue::new("status", status)]);
-        self.metrics.mirror_poll_duration.record(elapsed, &[]);
+            .add(1, &[mirror_attr.clone(), KeyValue::new("status", status)]);
+        self.metrics
+            .mirror_poll_duration
+            .record(elapsed, &[mirror_attr]);
 
         result
     }
@@ -181,9 +223,10 @@ impl MirrorProvider {
             "mirror poll complete"
         );
 
-        self.metrics
-            .mirror_records
-            .record(transformed.len() as u64, &[]);
+        self.metrics.mirror_records.record(
+            transformed.len() as u64,
+            &[KeyValue::new("mirror", self.name.clone())],
+        );
 
         let mut cache = self.cached_records.write().await;
         *cache = transformed;
@@ -466,7 +509,7 @@ impl MirrorProvider {
         let mut result = Vec::new();
 
         for record in source_records {
-            for rule in &self.config.rules {
+            for (rule_idx, rule) in self.config.rules.iter().enumerate() {
                 // Check type match
                 if let Some(ref type_match) = rule.r#match.r#type
                     && record.record_type != *type_match
@@ -481,18 +524,17 @@ impl MirrorProvider {
                     continue;
                 }
 
-                // Apply transformation
-                if let Some(transformed) = transform_name(
-                    &record.name,
-                    &self.config.source.zone,
-                    &rule.transform.suffix,
-                ) {
+                // Apply the pre-compiled transform for this rule.
+                let transformed = self.compiled_transforms[rule_idx]
+                    .apply(&record.name, &self.config.source.zone);
+
+                if let Some(transformed) = transformed {
                     match RecordValue::parse(&record.record_type, &record.value) {
                         Ok(value) => {
                             result.push(DesiredRecord {
                                 name: transformed,
                                 value,
-                                ttl: 300,
+                                ttl: rule.transform.ttl.unwrap_or(DEFAULT_MIRROR_TTL),
                             });
                         }
                         Err(e) => {
@@ -512,9 +554,27 @@ impl MirrorProvider {
     }
 }
 
+impl MirrorProvider {
+    /// Polling interval parsed from config. The service-entry loop uses this
+    /// to spawn per-instance tick tasks without reaching back into config.
+    pub(crate) fn interval(&self) -> Duration {
+        self.interval
+    }
+}
+
 impl Named for MirrorProvider {
     fn name(&self) -> &str {
-        "mirror"
+        &self.name
+    }
+}
+
+#[cfg(test)]
+impl MirrorProvider {
+    /// Test-only helper: seed the cached-records slot directly so integration
+    /// tests can exercise the `Provider` trait without a live DNS source.
+    pub(crate) async fn set_cache_for_test(&self, records: Vec<DesiredRecord>) {
+        let mut cache = self.cached_records.write().await;
+        *cache = records;
     }
 }
 
@@ -535,6 +595,69 @@ struct SourceRecord {
     name: String,
     record_type: String,
     value: String,
+}
+
+/// Runtime representation of a mirror transform.
+///
+/// Mirrors [`MirrorTransformKind`] but each variant carries whatever state
+/// the transform needs to run — for `Regex`, that's a compiled `regex::Regex`
+/// instead of the raw pattern string. Built once per rule at provider
+/// construction time via [`CompiledTransform::from_config`].
+///
+/// Keeping the compiled state inside the variant means `apply` is an
+/// exhaustive, self-contained match — callers don't need to know which
+/// variant they're holding or supply out-of-band parameters.
+#[derive(Debug)]
+enum CompiledTransform {
+    Suffix {
+        suffix: String,
+    },
+    Rename {
+        to: String,
+    },
+    Regex {
+        re: regex::Regex,
+        replacement: String,
+    },
+}
+
+impl CompiledTransform {
+    /// Build a `CompiledTransform` from a config-side `MirrorTransformKind`.
+    ///
+    /// Compiles the regex pattern if the variant requires one. This is the
+    /// single compile site — config validation does not pre-compile — so a
+    /// bad pattern surfaces here at startup inside `init_providers`.
+    fn from_config(kind: &MirrorTransformKind) -> Result<Self> {
+        Ok(match kind {
+            MirrorTransformKind::Suffix { suffix } => Self::Suffix {
+                suffix: suffix.clone(),
+            },
+            MirrorTransformKind::Rename { to } => Self::Rename { to: to.clone() },
+            MirrorTransformKind::Regex {
+                pattern,
+                replacement,
+            } => Self::Regex {
+                re: regex::Regex::new(pattern)
+                    .with_context(|| format!("compiling regex pattern {pattern:?}"))?,
+                replacement: replacement.clone(),
+            },
+        })
+    }
+
+    /// Apply the transform to a source name, returning the rewritten FQDN or
+    /// `None` if the transform doesn't produce a usable name. That includes
+    /// suffix mismatches, regex non-matches, and any variant whose output is
+    /// the empty string — an empty-label record would never reconcile.
+    fn apply(&self, name: &str, source_zone: &str) -> Option<String> {
+        let out = match self {
+            Self::Suffix { suffix } => transform_name(name, source_zone, suffix),
+            Self::Rename { to } => Some(to.clone()),
+            Self::Regex { re, replacement } => re
+                .is_match(name)
+                .then(|| re.replace_all(name, replacement.as_str()).into_owned()),
+        };
+        out.filter(|s| !s.is_empty())
+    }
 }
 
 /// Transform a DNS name by replacing its source suffix with a new suffix.
@@ -651,5 +774,264 @@ mod tests {
         ));
         assert!(glob_match("host.example.com", "host.example.com"));
         assert!(!glob_match("host.example.com", "other.example.com"));
+    }
+
+    // ── Transform dispatch (CompiledTransform) ──────────────────────────────
+
+    /// Compile a config-side kind into a runtime transform for tests. Panics
+    /// on regex-compile failure; tests use known-good patterns.
+    fn compile(kind: &MirrorTransformKind) -> CompiledTransform {
+        CompiledTransform::from_config(kind).expect("test regex must compile")
+    }
+
+    #[test]
+    fn test_compiled_transform_suffix() {
+        let t = compile(&MirrorTransformKind::Suffix {
+            suffix: "example.org".to_string(),
+        });
+        assert_eq!(
+            t.apply("host.internal.example.com", "internal.example.com"),
+            Some("host.example.org".to_string())
+        );
+        // Non-matching source suffix returns None.
+        assert_eq!(t.apply("other.example.com", "internal.example.com"), None);
+    }
+
+    #[test]
+    fn test_compiled_transform_rename() {
+        let t = compile(&MirrorTransformKind::Rename {
+            to: "mail.example.org".to_string(),
+        });
+        // Rename replaces the whole name regardless of the source.
+        assert_eq!(
+            t.apply("db-primary.corp.internal", "corp.internal"),
+            Some("mail.example.org".to_string())
+        );
+        // Rename is unconditional — source_zone mismatch does not block it.
+        assert_eq!(
+            t.apply("something.unrelated", "corp.internal"),
+            Some("mail.example.org".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compiled_transform_regex_capture() {
+        let t = compile(&MirrorTransformKind::Regex {
+            pattern: r"^(.+)\.internal\.corp$".to_string(),
+            replacement: "$1.public.org".to_string(),
+        });
+        assert_eq!(
+            t.apply("host.internal.corp", "corp"),
+            Some("host.public.org".to_string())
+        );
+        assert_eq!(
+            t.apply("a.b.internal.corp", "corp"),
+            Some("a.b.public.org".to_string())
+        );
+    }
+
+    #[test]
+    fn test_compiled_transform_regex_no_match() {
+        let t = compile(&MirrorTransformKind::Regex {
+            pattern: r"^(.+)\.internal\.corp$".to_string(),
+            replacement: "$1.public.org".to_string(),
+        });
+        // Pattern doesn't match — transform yields None (record is skipped).
+        assert_eq!(t.apply("host.other.tld", "corp"), None);
+    }
+
+    #[test]
+    fn test_compiled_transform_regex_empty_output_is_none() {
+        // A regex that matches but produces an empty string as the rewritten
+        // name should not emit a DesiredRecord — empty labels are never
+        // reconcilable and would just confuse downstream.
+        let t = compile(&MirrorTransformKind::Regex {
+            pattern: r"^.*$".to_string(),
+            replacement: String::new(),
+        });
+        assert_eq!(t.apply("host.example.com", "example.com"), None);
+    }
+
+    #[test]
+    fn test_compiled_transform_rename_to_empty_is_none() {
+        // Defense in depth: even if config validation ever lets an empty
+        // `to:` through, the transform itself refuses to emit an empty name.
+        let t = compile(&MirrorTransformKind::Rename { to: String::new() });
+        assert_eq!(t.apply("anything", "anywhere"), None);
+    }
+
+    #[test]
+    fn test_compiled_transform_regex_invalid_pattern_fails() {
+        // `from_config` surfaces regex-compile errors to the caller.
+        let result = CompiledTransform::from_config(&MirrorTransformKind::Regex {
+            pattern: "[unclosed".to_string(),
+            replacement: "$1".to_string(),
+        });
+        assert!(result.is_err(), "expected compile failure for bad pattern");
+    }
+
+    // ── Instance name fallback ───────────────────────────────────────────────
+
+    #[test]
+    fn test_display_name_explicit() {
+        let cfg = MirrorProviderConfig {
+            name: Some("internal-technitium".to_string()),
+            source: crate::config::MirrorSource {
+                r#type: "dns".to_string(),
+                url: None,
+                zone: "internal.example.com".to_string(),
+                token_file: None,
+                subdomains: vec![],
+                nameserver: None,
+                tsig_key_name: None,
+            },
+            rules: vec![],
+            interval: "5m".to_string(),
+        };
+        assert_eq!(cfg.display_name(0), "internal-technitium");
+        // Index is ignored when an explicit name is set.
+        assert_eq!(cfg.display_name(7), "internal-technitium");
+    }
+
+    #[test]
+    fn test_display_name_falls_back_to_indexed() {
+        let cfg = MirrorProviderConfig {
+            name: None,
+            source: crate::config::MirrorSource {
+                r#type: "dns".to_string(),
+                url: None,
+                zone: "internal.example.com".to_string(),
+                token_file: None,
+                subdomains: vec![],
+                nameserver: None,
+                tsig_key_name: None,
+            },
+            rules: vec![],
+            interval: "5m".to_string(),
+        };
+        assert_eq!(cfg.display_name(0), "mirror[0]");
+        assert_eq!(cfg.display_name(2), "mirror[2]");
+    }
+
+    // ── Full apply_rules pipeline ────────────────────────────────────────────
+
+    use crate::config::{MirrorMatch, MirrorRule, MirrorSource, MirrorTransform};
+    use crate::telemetry::Metrics;
+
+    /// Build a `MirrorProvider` backed by a `dns` source (no network I/O at
+    /// construction) so `apply_rules` can be exercised directly without
+    /// spinning up a fake upstream.
+    async fn build_provider(source_zone: &str, rules: Vec<MirrorRule>) -> MirrorProvider {
+        let cfg = MirrorProviderConfig {
+            name: Some("test".to_string()),
+            source: MirrorSource {
+                r#type: "dns".to_string(),
+                url: None,
+                zone: source_zone.to_string(),
+                token_file: None,
+                subdomains: vec![],
+                nameserver: None,
+                tsig_key_name: None,
+            },
+            rules,
+            interval: "5m".to_string(),
+        };
+        MirrorProvider::new(cfg, 0, Metrics::noop())
+            .await
+            .expect("mirror provider must build")
+    }
+
+    /// Exercises the full `apply_rules` pipeline — match filtering, all three
+    /// transform kinds in one pass, and per-rule TTL override — against
+    /// hand-built source records. Complements the per-variant unit tests.
+    #[tokio::test]
+    async fn test_apply_rules_full_pipeline() {
+        let rules = vec![
+            // AAAA records in the source zone → example.org, with 600s TTL.
+            MirrorRule {
+                r#match: MirrorMatch {
+                    r#type: Some("AAAA".to_string()),
+                    name: None,
+                },
+                transform: MirrorTransform {
+                    kind: MirrorTransformKind::Suffix {
+                        suffix: "example.org".to_string(),
+                    },
+                    ttl: Some(600),
+                },
+            },
+            // A specific A record gets hard-renamed; TTL falls back to default.
+            MirrorRule {
+                r#match: MirrorMatch {
+                    r#type: Some("A".to_string()),
+                    name: Some("db-primary.internal.corp".to_string()),
+                },
+                transform: MirrorTransform {
+                    kind: MirrorTransformKind::Rename {
+                        to: "db.example.org".to_string(),
+                    },
+                    ttl: None,
+                },
+            },
+            // Regex rewrites `*.legacy.internal.corp` into example.org.
+            MirrorRule {
+                r#match: MirrorMatch {
+                    r#type: Some("A".to_string()),
+                    name: None,
+                },
+                transform: MirrorTransform {
+                    kind: MirrorTransformKind::Regex {
+                        pattern: r"^(.+)\.legacy\.internal\.corp$".to_string(),
+                        replacement: "$1.example.org".to_string(),
+                    },
+                    ttl: Some(120),
+                },
+            },
+        ];
+        let provider = build_provider("internal.corp", rules).await;
+
+        let source_records = vec![
+            SourceRecord {
+                name: "host.internal.corp".to_string(),
+                record_type: "AAAA".to_string(),
+                value: "2001:db8::1".to_string(),
+            },
+            SourceRecord {
+                name: "db-primary.internal.corp".to_string(),
+                record_type: "A".to_string(),
+                value: "198.51.100.1".to_string(),
+            },
+            SourceRecord {
+                name: "old.legacy.internal.corp".to_string(),
+                record_type: "A".to_string(),
+                value: "198.51.100.2".to_string(),
+            },
+            // No rule matches this — it should drop out entirely.
+            SourceRecord {
+                name: "ignored.internal.corp".to_string(),
+                record_type: "MX".to_string(),
+                value: "10:mail.internal.corp".to_string(),
+            },
+        ];
+
+        let out = provider.apply_rules(source_records);
+        // Three source records produce three output records (suffix, rename,
+        // regex). The MX record matches no rule and is dropped.
+        assert_eq!(out.len(), 3, "expected 3 mirrored records, got {out:?}");
+
+        let by_name: std::collections::HashMap<&str, &DesiredRecord> =
+            out.iter().map(|r| (r.name.as_str(), r)).collect();
+
+        let aaaa = by_name.get("host.example.org").expect("suffix output");
+        assert_eq!(aaaa.ttl, 600, "explicit TTL override must survive");
+
+        let db = by_name.get("db.example.org").expect("rename output");
+        assert_eq!(
+            db.ttl, DEFAULT_MIRROR_TTL,
+            "absent ttl falls back to default"
+        );
+
+        let legacy = by_name.get("old.example.org").expect("regex output");
+        assert_eq!(legacy.ttl, 120);
     }
 }

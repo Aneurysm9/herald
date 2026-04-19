@@ -189,39 +189,69 @@ providers:
         value: "203.0.113.1"
         ttl: 300
 
-  # Mirror records from internal DNS
+  # Mirror records from internal DNS.
+  #
+  # `mirror` is a LIST — multiple mirror instances can run side-by-side, each
+  # with its own source, rule set, and polling interval. Each entry may
+  # specify an optional `name` for logs and metrics; if omitted it falls
+  # back to `mirror[{index}]`.
   mirror:
-    source:
-      # Option 1: Technitium API (requires API access)
-      type: technitium
-      url: "http://ns01.internal.example.com:5380"
-      zone: "internal.example.com"
-      token_file: "/run/secrets/herald_technitium_token"
+    - name: "internal-technitium"          # optional; used in logs/metrics
+      source:
+        type: technitium                   # Technitium API (requires API access)
+        url: "http://ns01.internal.example.com:5380"
+        zone: "internal.example.com"
+        token_file: "/run/secrets/herald_technitium_token"
+      rules:
+        - match:
+            type: AAAA                     # only AAAA records
+          transform:
+            type: suffix                   # replace source zone suffix
+            suffix: "example.org"
+            ttl: 600                       # optional: override default 300s TTL
+        - match:
+            type: A
+            name: "*.internal.example.com"
+          transform:
+            type: suffix
+            suffix: "example.org"
+      interval: "5m"
 
-      # Option 2: Direct DNS queries (works with any DNS server)
-      # type: dns
-      # zone: "internal.example.com"
-      # subdomains:  # optional: explicit list of subdomains to query
-      #   - "host1"
-      #   - "host2"
+    - name: "corp-axfr"
+      source:
+        type: rfc2136                      # AXFR zone transfer
+        zone: "corp.internal"
+        nameserver: "ns1.corp.internal:53"
+        token_file: "/run/secrets/tsig_key"      # optional TSIG for AXFR auth
+        tsig_key_name: "axfr.corp.internal"
+      rules:
+        # `rename` replaces the full FQDN for a specific record.
+        - match:
+            type: A
+            name: "db-primary.corp.internal"
+          transform:
+            type: rename
+            to: "db.example.org"
+        # `regex` applies a pattern with capture-group replacement.
+        - match: {}
+          transform:
+            type: regex
+            pattern: '^(.+)\.legacy\.corp\.internal$'
+            replacement: '$1.public.example.org'
+      interval: "1m"
 
-      # Option 3: AXFR zone transfer (RFC 2136-compatible authoritative server)
-      # type: rfc2136
-      # zone: "internal.example.com"
-      # nameserver: "ns1.internal.example.com:53"
-      # tsig_key_file: "/run/secrets/tsig_key"  # optional TSIG for AXFR auth
-      # tsig_key_name: "axfr.internal.example.com"
-    rules:
-      - match:
-          type: AAAA             # only AAAA records
-        transform:
-          suffix: "example.org"  # replace source zone suffix
-      - match:
-          type: A
-          name: "*.internal.example.com"
-        transform:
-          suffix: "example.org"
-    interval: "5m"
+    # A third entry using direct DNS queries against any server, without
+    # API access. `subdomains` lists names to query beyond the zone apex.
+    - source:                              # no name → falls back to `mirror[2]`
+        type: dns
+        zone: "internal.example.com"
+        subdomains:
+          - "host1"
+          - "host2"
+      rules:
+        - match: { type: A }
+          transform: { type: suffix, suffix: "example.org" }
+      interval: "10m"
 
   # ACME DNS-01 challenge proxy
   acme:

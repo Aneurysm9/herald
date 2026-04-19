@@ -67,6 +67,9 @@ futures-util = "0.3"
 # Human-readable duration parsing (e.g., "1m", "5m30s")
 humantime = "2"
 
+# Regex support (used for mirror transforms)
+regex = "1"
+
 # CLI
 clap = { version = "4", features = ["derive"] }
 

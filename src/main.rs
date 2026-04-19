@@ -71,11 +71,11 @@ use crate::backend::rfc2136::Rfc2136Backend;
 use crate::backend::technitium::TechnitiumBackend;
 use crate::config::Config;
 use crate::dns_server::DnsServer;
-use crate::provider::Provider;
 use crate::provider::acme::AcmeProvider;
 use crate::provider::dynamic::DynamicProvider;
 use crate::provider::mirror::MirrorProvider;
 use crate::provider::r#static::StaticProvider;
+use crate::provider::{Named, Provider};
 use crate::reconciler::Reconciler;
 use crate::telemetry::Metrics;
 
@@ -132,7 +132,7 @@ async fn main() -> Result<()> {
     let initialized_providers = init_providers(&config, metrics.clone()).await?;
     let providers = initialized_providers.all;
     let acme_provider = initialized_providers.acme;
-    let mirror_provider = initialized_providers.mirror;
+    let mirror_providers = initialized_providers.mirrors;
     let dynamic_provider = initialized_providers.dynamic;
 
     let reconciler = Arc::new(Reconciler::new(dry_run, metrics.clone()));
@@ -141,10 +141,10 @@ async fn main() -> Result<()> {
     if cli.once {
         tracing::info!("running single reconciliation pass (--once)");
 
-        if let Some(ref mirror) = mirror_provider
-            && let Err(e) = mirror.poll().await
-        {
-            tracing::error!(error = %e, "mirror poll failed");
+        for mirror in &mirror_providers {
+            if let Err(e) = mirror.poll().await {
+                tracing::error!(mirror = %mirror.name(), error = %e, "mirror poll failed");
+            }
         }
 
         reconciler.reconcile(&providers, &backends).await?;
@@ -167,7 +167,7 @@ async fn main() -> Result<()> {
         reconciler,
         acme_provider,
         dynamic_provider,
-        mirror_provider,
+        mirror_providers,
         metrics,
     )
     .await?;
@@ -186,7 +186,7 @@ async fn main() -> Result<()> {
 struct InitializedProviders {
     all: Vec<Arc<dyn Provider>>,
     acme: Option<Arc<AcmeProvider>>,
-    mirror: Option<Arc<MirrorProvider>>,
+    mirrors: Vec<Arc<MirrorProvider>>,
     dynamic: Option<Arc<DynamicProvider>>,
 }
 
@@ -217,14 +217,13 @@ async fn init_providers(config: &Config, metrics: Metrics) -> Result<Initialized
         None
     };
 
-    let mirror = if let Some(ref mirror_config) = config.providers.mirror {
-        let p = Arc::new(MirrorProvider::new(mirror_config.clone(), metrics.clone()).await?);
-        tracing::info!("mirror provider loaded");
+    let mut mirrors: Vec<Arc<MirrorProvider>> = Vec::new();
+    for (idx, mirror_config) in config.providers.mirror.iter().enumerate() {
+        let p = Arc::new(MirrorProvider::new(mirror_config.clone(), idx, metrics.clone()).await?);
+        tracing::info!(mirror = %p.name(), "mirror provider loaded");
         all.push(Arc::clone(&p) as Arc<dyn Provider>);
-        Some(p)
-    } else {
-        None
-    };
+        mirrors.push(p);
+    }
 
     let dynamic = if let Some(ref dynamic_config) = config.providers.dynamic {
         let storage_path = Some(std::path::PathBuf::from(&config.state_dir).join("dynamic.db"));
@@ -247,7 +246,7 @@ async fn init_providers(config: &Config, metrics: Metrics) -> Result<Initialized
     Ok(InitializedProviders {
         all,
         acme,
-        mirror,
+        mirrors,
         dynamic,
     })
 }
@@ -329,7 +328,7 @@ async fn run_service(
     reconciler: Arc<Reconciler>,
     acme_provider: Option<Arc<AcmeProvider>>,
     dynamic_provider: Option<Arc<DynamicProvider>>,
-    mirror_provider: Option<Arc<MirrorProvider>>,
+    mirror_providers: Vec<Arc<MirrorProvider>>,
     metrics: Metrics,
 ) -> Result<()> {
     // Load client tokens from top-level tokens_file
@@ -409,39 +408,36 @@ async fn run_service(
     let reconciler_interval =
         parse_duration(&config.reconciler.interval).context("invalid reconciler interval")?;
 
-    // Spawn mirror polling loop
-    let mirror_task = if let Some(ref mirror) = mirror_provider {
-        let interval = parse_duration(
-            &config
-                .providers
-                .mirror
-                .as_ref()
-                .context("mirror config missing despite mirror provider being initialized")?
-                .interval,
-        )
-        .context("invalid mirror interval")?;
+    // Spawn one polling task per configured mirror instance. Each provider
+    // carries its own parsed interval, so the loop doesn't read the config
+    // by positional index.
+    let mut mirror_tasks: Vec<tokio::task::JoinHandle<()>> =
+        Vec::with_capacity(mirror_providers.len());
+    for mirror in &mirror_providers {
+        let interval = mirror.interval();
 
-        // Initial poll before entering the loop
+        // Initial poll before entering the per-mirror loop so records are
+        // available on the first reconciliation tick.
         if let Err(e) = mirror.poll().await {
-            tracing::error!(error = %e, "initial mirror poll failed");
+            tracing::error!(mirror = %mirror.name(), error = %e, "initial mirror poll failed");
         }
 
         let mirror = Arc::clone(mirror);
         let notify = Arc::clone(&reconcile_notify);
-        Some(tokio::spawn(async move {
+        mirror_tasks.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
             ticker.tick().await; // consume the immediate first tick
             loop {
                 ticker.tick().await;
                 match mirror.poll().await {
                     Ok(()) => notify.notify_one(),
-                    Err(e) => tracing::error!(error = %e, "mirror poll failed"),
+                    Err(e) => {
+                        tracing::error!(mirror = %mirror.name(), error = %e, "mirror poll failed");
+                    }
                 }
             }
-        }))
-    } else {
-        None
-    };
+        }));
+    }
 
     // Main reconciliation loop
     let mut ticker = tokio::time::interval(reconciler_interval);
@@ -467,7 +463,7 @@ async fn run_service(
         }
     }
 
-    if let Some(task) = mirror_task {
+    for task in mirror_tasks {
         task.abort();
     }
 

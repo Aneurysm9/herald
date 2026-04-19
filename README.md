@@ -13,7 +13,7 @@ Managing DNS records across multiple providers and zones is tedious and error-pr
 
 - **Declarative static records** — define DNS records in a config file; Herald reconciles them to your backends
 - **ACME challenge proxy** — per-service scoped tokens for DNS-01 certificate validation, compatible with lego and acme.sh
-- **DNS mirroring** — poll internal DNS zones (Technitium API, direct DNS queries, or AXFR zone transfer) and mirror selected records to public DNS under different names
+- **DNS mirroring** — poll one or more internal DNS zones (Technitium API, direct DNS queries, or AXFR zone transfer) and mirror selected records to public DNS under different names, with per-mirror rules (suffix/rename/regex) and TTL overrides
 - **Dynamic DNS** — API-driven record management with fine-grained domain and zone permission scoping (DynDNS protocol compatible)
 - **RFC 2136 backend** — send DNS UPDATE messages to any authoritative server (BIND, Knot, PowerDNS) with TSIG authentication, prerequisite-based consistency checks, and self-healing state resync
 - **DNS UPDATE receiver** — accept nsupdate-compatible DNS UPDATE messages as an alternative to the HTTP API (OPNsense compatible)

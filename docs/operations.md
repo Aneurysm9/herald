@@ -51,24 +51,31 @@ Herald includes a NixOS module (`services.herald`) in the [nixos repo](https://g
           }
         ];
 
-        mirror = {
-          source = {
-            type = "technitium";
-            url = "http://ns01.internal.example.org:5380";
-            zone = "internal.example.org";
-            token_file = config.sops.secrets.herald_technitium_token.path;
-          };
-          rules = [
-            {
-              match.type = "AAAA";
-              transform = {
-                suffix = "example.com";
-                zone = "example.com";
-              };
-            }
-          ];
-          interval = "5m";
-        };
+        # `mirror` is a LIST — one entry per mirror instance. Each entry may
+        # optionally set `name` for logs/metrics; otherwise falls back to
+        # `mirror[{index}]`.
+        mirror = [
+          {
+            name = "internal-technitium";
+            source = {
+              type = "technitium";
+              url = "http://ns01.internal.example.org:5380";
+              zone = "internal.example.org";
+              token_file = config.sops.secrets.herald_technitium_token.path;
+            };
+            rules = [
+              {
+                match.type = "AAAA";
+                transform = {
+                  type = "suffix";
+                  suffix = "example.com";
+                  ttl = 600;          # optional per-rule TTL override
+                };
+              }
+            ];
+            interval = "5m";
+          }
+        ];
 
         acme = {
           zone = "example.com";
@@ -202,12 +209,19 @@ All configuration keys with types, defaults, and environment variable overrides.
 | `backends.cloudflare.zones` | array | (required) | (not supported) | List of Cloudflare zone names to manage |
 | `backends.cloudflare.token_file` | string | (required) | `HERALD_BACKENDS_CLOUDFLARE_TOKEN_FILE` | Path to Cloudflare API token file |
 | `providers.static.records` | array | `[]` | (not supported) | Static DNS records to manage |
-| `providers.mirror.source.type` | string | — | — | Mirror source type (`technitium` or `dns`) |
-| `providers.mirror.source.url` | string | — | — | Source API or DNS server URL |
-| `providers.mirror.source.zone` | string | — | — | Source zone to mirror |
-| `providers.mirror.source.token_file` | string | — | — | API token file (for Technitium) |
-| `providers.mirror.rules` | array | — | — | Transformation rules (match + transform) |
-| `providers.mirror.interval` | string | `"5m"` | — | Mirror polling interval |
+| `providers.mirror` | array | `[]` | — | List of mirror instances; each has its own source, rules, and interval |
+| `providers.mirror[].name` | string | (optional) | — | Instance name for logs and metrics (falls back to `mirror[{index}]`) |
+| `providers.mirror[].source.type` | string | — | — | Mirror source type: `technitium`, `dns`, or `rfc2136` |
+| `providers.mirror[].source.url` | string | — | — | Source API URL (Technitium only) |
+| `providers.mirror[].source.zone` | string | — | — | Source zone to mirror |
+| `providers.mirror[].source.token_file` | string | — | — | API token file (Technitium) or base64 TSIG secret (rfc2136) |
+| `providers.mirror[].source.nameserver` | string | — | — | Authoritative server for AXFR (rfc2136 only, `host:port`) |
+| `providers.mirror[].source.tsig_key_name` | string | — | — | TSIG key name for AXFR auth (rfc2136 only) |
+| `providers.mirror[].source.subdomains` | array | `[]` | — | Subdomains to query beyond the apex (dns only) |
+| `providers.mirror[].rules` | array | — | — | Transformation rules (match + transform); at least one required |
+| `providers.mirror[].rules[].transform.type` | string | — | — | Transform kind: `suffix`, `rename`, or `regex` |
+| `providers.mirror[].rules[].transform.ttl` | int | `300` | — | Optional per-rule TTL override for contributed records |
+| `providers.mirror[].interval` | string | `"5m"` | — | Polling interval for this instance |
 | `providers.acme.zone` | string | (required if acme enabled) | — | Target zone for ACME challenges |
 | `providers.acme.domain` | string | (required if acme enabled) | — | Base domain for ACME challenges |
 | `providers.acme.clients` | map | — | — | Client configurations with allowed_domains |
@@ -409,9 +423,9 @@ All metrics use the `herald.*` namespace. 14 metrics are exported:
 | `herald.provider.errors` | Counter | `provider` | Number of provider errors |
 | `herald.acme.challenges.active` | UpDownCounter | — | Number of active ACME challenges |
 | `herald.acme.operations` | Counter | `operation`, `status` | ACME operations (`operation=set/clear`, `status=success/error`) |
-| `herald.mirror.polls` | Counter | — | Number of mirror poll operations |
-| `herald.mirror.poll_duration` | Histogram | — | Duration of mirror polls (seconds) |
-| `herald.mirror.records` | Gauge | — | Number of mirrored records |
+| `herald.mirror.polls` | Counter | `mirror`, `status` | Number of mirror poll operations; `mirror` attribute carries the per-instance name (e.g., `internal-technitium`, `mirror[1]`) |
+| `herald.mirror.poll_duration` | Histogram | `mirror` | Duration of mirror polls (seconds), labeled by instance name |
+| `herald.mirror.records` | Gauge | `mirror` | Number of mirrored records contributed by each instance |
 | `herald.dynamic.operations` | Counter | `operation`, `status` | Dynamic DNS operations (`operation=set/delete`, `status=success/error`) |
 | `herald.dynamic.records.active` | Gauge | — | Number of active dynamic DNS records |
 | `herald.backend.api_calls` | Counter | `operation`, `status` | Backend API calls (`operation=get_records/create/update/delete`, `status=success/error`) |
@@ -745,17 +759,19 @@ The RFC 2136 mirror source type uses AXFR zone transfer to enumerate all records
 ```yaml
 providers:
   mirror:
-    source:
-      type: rfc2136
-      zone: "internal.example.com"
-      nameserver: "ns1.internal.example.com:53"
-      tsig_key_file: "/run/secrets/axfr_key"    # optional TSIG for AXFR authentication
-      tsig_key_name: "axfr.internal.example.com"
-    rules:
-      - match:
-          type: AAAA
-        transform:
-          suffix: "example.org"
+    - name: "internal-axfr"
+      source:
+        type: rfc2136
+        zone: "internal.example.com"
+        nameserver: "ns1.internal.example.com:53"
+        token_file: "/run/secrets/axfr_key"      # optional TSIG for AXFR authentication
+        tsig_key_name: "axfr.internal.example.com"
+      rules:
+        - match:
+            type: AAAA
+          transform:
+            type: suffix
+            suffix: "example.org"
 ```
 
 AXFR requires that the authoritative server permits zone transfers from Herald's IP. In BIND:
@@ -903,17 +919,22 @@ providers:
     domain: "acme.example.com"
 
   mirror:
-    rules:
-      - match:
-          type: AAAA
-        transform:
-          suffix: "example.com"
-          zone: "example.com"  # Mirror targets this zone
-      - match:
-          type: A
-        transform:
-          suffix: "internal.example.org"
-          zone: "internal.example.org"  # Different mirror rule, different zone
+    - name: "public-aaaa"
+      source: { type: dns, zone: "internal.example.com" }
+      rules:
+        - match:
+            type: AAAA
+          transform:
+            type: suffix
+            suffix: "example.com"          # Mirrors AAAA records into example.com
+    - name: "internal-a"
+      source: { type: dns, zone: "internal.example.org" }
+      rules:
+        - match:
+            type: A
+          transform:
+            type: suffix
+            suffix: "internal.example.org" # Different instance, different zone
 ```
 
 ### Reconciliation
