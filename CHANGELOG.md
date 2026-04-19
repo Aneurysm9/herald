@@ -1,5 +1,37 @@
 # Changelog
 
+## [0.3.0] — 2026-04-19
+
+### Features
+
+- Support multiple mirror providers with richer transforms([f2e0419](https://github.com/Aneurysm9/herald/commit/f2e04199e4cd8c61d83691c6cbacc638b9b89cc0)) **BREAKING**
+
+- Add per-client rate limiting on API and DNS UPDATE endpoints (#22)([8a19011](https://github.com/Aneurysm9/herald/commit/8a1901129c70238d190468487199b0d2b3daa8cf))
+
+- Add in-process integration tests (#21)([21d5ffe](https://github.com/Aneurysm9/herald/commit/21d5ffe038b3d1e480e0afc35df24aecee7938b4))
+
+- Add config validation at startup (#19)([5750bef](https://github.com/Aneurysm9/herald/commit/5750befd08d8b8c3468eeb715ea9c02c5ac6e5d4))
+
+- Targeted per-name prerequisite queries([e9b3160](https://github.com/Aneurysm9/herald/commit/e9b31603e4ceb7c790c68280fb8744b9a09338de))
+
+- Add prerequisite support and self-healing state resync([5cb047b](https://github.com/Aneurysm9/herald/commit/5cb047bec90d875e8e26e9586b5f1296d140b8b8))
+
+- Wire metrics, add spans, fix DNS UPDATE log levels([6860fa1](https://github.com/Aneurysm9/herald/commit/6860fa18e59a04212937de5d61e799040c42eccc))
+
+
+### Bug Fixes
+
+- Persist to SQLite before updating in-memory state (#18)([017c03f](https://github.com/Aneurysm9/herald/commit/017c03f006a08206f40f1e57dbe80fec8cc80df9))
+
+- Use workflow_run trigger for release hash updates([6d5eda3](https://github.com/Aneurysm9/herald/commit/6d5eda31dd8aad71a3e5efe2cd031fdaa3b81460))
+
+
+### Refactoring
+
+- Split dns_server.rs into focused submodules (#20)([3416825](https://github.com/Aneurysm9/herald/commit/3416825633bc05bac54ddd839c9f7788b9e87beb))
+
+- Clean up module namespace and eliminate redundant types([9289fd8](https://github.com/Aneurysm9/herald/commit/9289fd8205445aea255f250f4559d548d15511e1))
+
 ## [0.2.0] — 2026-04-17
 
 ### Features
