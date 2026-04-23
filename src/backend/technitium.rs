@@ -1,4 +1,4 @@
-use super::technitium_util::{TechnitiumResponse, extract_rdata};
+use super::technitium_util::{TechnitiumRecord, TechnitiumResponse, extract_rdata};
 use super::{Backend, Change, ExistingRecord};
 use crate::config::TechnitiumConfig;
 use crate::provider::{EnrichedRecord, Named, RecordValue};
@@ -308,6 +308,53 @@ impl Backend for TechnitiumBackend {
     }
 }
 
+impl TechnitiumRecord {
+    /// Convert this wire-format Technitium record into an [`ExistingRecord`]
+    /// scoped to `zone`. Returns `None` (with a debug log) for unsupported
+    /// types or unparseable values — these are intentional skips rather
+    /// than errors, so the reconciler quietly drops them and moves on.
+    fn into_existing(self, zone: &str) -> Option<ExistingRecord> {
+        let managed = self
+            .comments
+            .as_ref()
+            .is_some_and(|c| c.contains(MANAGED_COMMENT));
+
+        let Some(raw_value) = extract_rdata(&self.r#type, &self.r_data) else {
+            tracing::debug!(
+                name = %self.name,
+                record_type = %self.r#type,
+                "skipping record with unsupported type or missing rData"
+            );
+            return None;
+        };
+
+        match RecordValue::parse(&self.r#type, &raw_value) {
+            Ok(value) => {
+                let id = format!("{}.{}.{raw_value}", self.name, self.r#type);
+                Some(ExistingRecord {
+                    id,
+                    record: EnrichedRecord {
+                        zone: zone.to_string(),
+                        name: self.name,
+                        value,
+                        ttl: self.ttl,
+                    },
+                    managed,
+                })
+            }
+            Err(e) => {
+                tracing::debug!(
+                    name = %self.name,
+                    record_type = %self.r#type,
+                    error = %e,
+                    "skipping Technitium record with unparseable value"
+                );
+                None
+            }
+        }
+    }
+}
+
 impl TechnitiumBackend {
     async fn get_records_inner(&self) -> Result<Vec<ExistingRecord>> {
         let start = Instant::now();
@@ -326,7 +373,12 @@ impl TechnitiumBackend {
                 let resp = self
                     .client
                     .get(&url)
-                    .query(&[("token", &self.token), ("domain", zone), ("zone", zone)])
+                    .query(&[
+                        ("token", self.token.as_str()),
+                        ("domain", zone.as_str()),
+                        ("zone", zone.as_str()),
+                        ("listZone", "true"),
+                    ])
                     .send()
                     .await
                     .context("technitium API request failed")?;
@@ -353,41 +405,8 @@ impl TechnitiumBackend {
                     .context("parsing technitium API success response")?;
 
                 for rec in body.response.records {
-                    let managed = rec
-                        .comments
-                        .as_ref()
-                        .is_some_and(|c| c.contains(MANAGED_COMMENT));
-
-                    if let Some(raw_value) = extract_rdata(&rec.r#type, &rec.r_data) {
-                        match RecordValue::parse(&rec.r#type, &raw_value) {
-                            Ok(value) => {
-                                let id = format!("{}.{}.{raw_value}", rec.name, rec.r#type);
-                                all_records.push(ExistingRecord {
-                                    id,
-                                    record: EnrichedRecord {
-                                        zone: zone.clone(),
-                                        name: rec.name,
-                                        value,
-                                        ttl: rec.ttl,
-                                    },
-                                    managed,
-                                });
-                            }
-                            Err(e) => {
-                                tracing::debug!(
-                                    name = %rec.name,
-                                    record_type = %rec.r#type,
-                                    error = %e,
-                                    "skipping Technitium record with unparseable value"
-                                );
-                            }
-                        }
-                    } else {
-                        tracing::debug!(
-                            name = %rec.name,
-                            record_type = %rec.r#type,
-                            "skipping record with unsupported type or missing rData"
-                        );
+                    if let Some(record) = rec.into_existing(zone) {
+                        all_records.push(record);
                     }
                 }
             }
@@ -494,6 +513,7 @@ mod tests {
             .and(path("/api/zones/records/get"))
             .and(query_param("token", "test-token"))
             .and(query_param("zone", "test.local"))
+            .and(query_param("listZone", "true"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(technitium_records_response(&json!([
                     {
@@ -528,6 +548,7 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/api/zones/records/get"))
+            .and(query_param("listZone", "true"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(technitium_records_response(&json!([
                     {
@@ -549,12 +570,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_records_returns_subdomain_records() {
+        // Regression: Technitium returns records at deeper subdomain depths
+        // only when listZone=true is passed. Without it, the reconciler sees
+        // an empty actual state for subdomain records and plans spurious CREATEs
+        // that fail with "record already exists".
+        let server = MockServer::start().await;
+        let backend = TechnitiumBackend::with_base_url(
+            "test-technitium".to_string(),
+            server.uri(),
+            vec!["internal.example.com".to_string()],
+            "test-token".to_string(),
+        );
+
+        Mock::given(method("GET"))
+            .and(path("/api/zones/records/get"))
+            .and(query_param("domain", "internal.example.com"))
+            .and(query_param("zone", "internal.example.com"))
+            .and(query_param("listZone", "true"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(technitium_records_response(&json!([
+                    {
+                        "name": "host1.subnet1.internal.example.com",
+                        "type": "A",
+                        "ttl": 300,
+                        "rData": {"ipAddress": "192.0.2.10"},
+                        "comments": "managed-by: herald"
+                    },
+                    {
+                        "name": "host2.subnet2.internal.example.com",
+                        "type": "AAAA",
+                        "ttl": 300,
+                        "rData": {"ipAddress": "2001:db8::1"},
+                        "comments": "managed-by: herald"
+                    }
+                ]))),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let records = backend.get_records().await.unwrap();
+
+        assert_eq!(records.len(), 2);
+
+        let host1 = records
+            .iter()
+            .find(|r| r.record.name == "host1.subnet1.internal.example.com")
+            .expect("subnet1-depth subdomain record should be returned");
+        assert_eq!(host1.record.zone, "internal.example.com");
+        assert_eq!(
+            host1.record.value,
+            RecordValue::A("192.0.2.10".parse().unwrap())
+        );
+        assert!(host1.managed);
+
+        let host2 = records
+            .iter()
+            .find(|r| r.record.name == "host2.subnet2.internal.example.com")
+            .expect("subnet2-depth subdomain record should be returned");
+        assert_eq!(host2.record.zone, "internal.example.com");
+        assert!(host2.managed);
+    }
+
+    #[tokio::test]
     async fn test_get_records_api_error() {
         let server = MockServer::start().await;
         let backend = test_backend(&server);
 
         Mock::given(method("GET"))
             .and(path("/api/zones/records/get"))
+            .and(query_param("listZone", "true"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(technitium_error_response("Access denied")),

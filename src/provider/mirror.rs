@@ -262,7 +262,12 @@ impl MirrorProvider {
         let resp = self
             .client
             .get(&url)
-            .query(&[("token", token), ("domain", zone), ("zone", zone)])
+            .query(&[
+                ("token", token),
+                ("domain", zone.as_str()),
+                ("zone", zone.as_str()),
+                ("listZone", "true"),
+            ])
             .send()
             .await
             .context("technitium API request failed")?;
@@ -575,6 +580,43 @@ impl MirrorProvider {
     pub(crate) async fn set_cache_for_test(&self, records: Vec<DesiredRecord>) {
         let mut cache = self.cached_records.write().await;
         *cache = records;
+    }
+
+    /// Test-only constructor for a Technitium-source provider that bypasses
+    /// the async `new()` flow (token file reads, rule compilation). Used by
+    /// wiremock tests that exercise the HTTP request path in `poll_technitium`.
+    fn test_with_technitium(url: String, zone: String, token: String) -> Self {
+        use crate::config::MirrorSource;
+        let resolver = TokioResolver::builder_tokio()
+            .expect("test resolver init")
+            .build()
+            .expect("test resolver build");
+        Self {
+            name: "test-mirror".to_string(),
+            interval: Duration::from_secs(300),
+            config: MirrorProviderConfig {
+                name: None,
+                source: MirrorSource {
+                    r#type: "technitium".to_string(),
+                    url: Some(url),
+                    zone,
+                    token_file: None,
+                    subdomains: Vec::new(),
+                    nameserver: None,
+                    tsig_key_name: None,
+                },
+                rules: Vec::new(),
+                interval: "5m".to_string(),
+            },
+            compiled_transforms: Vec::new(),
+            cached_records: Arc::new(RwLock::new(Vec::new())),
+            client: reqwest::Client::new(),
+            technitium_token: Some(token),
+            tsig_signer: None,
+            rfc2136_nameserver: None,
+            resolver,
+            metrics: Metrics::noop(),
+        }
     }
 }
 
@@ -1033,5 +1075,51 @@ mod tests {
 
         let legacy = by_name.get("old.example.org").expect("regex output");
         assert_eq!(legacy.ttl, 120);
+    }
+
+    #[tokio::test]
+    async fn test_poll_technitium_sends_list_zone_true() {
+        // Regression: the mirror provider's Technitium source must pass
+        // listZone=true so records at arbitrary subdomain depths are returned.
+        // Without it, only records at the exact zone apex come back.
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/api/zones/records/get"))
+            .and(query_param("token", "test-token"))
+            .and(query_param("zone", "internal.example.com"))
+            .and(query_param("listZone", "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "status": "ok",
+                "response": {
+                    "records": [
+                        {
+                            "name": "host1.subnet1.internal.example.com",
+                            "type": "A",
+                            "ttl": 300,
+                            "rData": {"ipAddress": "192.0.2.10"}
+                        }
+                    ]
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let provider = MirrorProvider::test_with_technitium(
+            server.uri(),
+            "internal.example.com".to_string(),
+            "test-token".to_string(),
+        );
+
+        let records = provider.poll_technitium().await.expect("poll_technitium");
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].name, "host1.subnet1.internal.example.com");
+        assert_eq!(records[0].record_type, "A");
+        assert_eq!(records[0].value, "192.0.2.10");
     }
 }
