@@ -43,8 +43,10 @@ pub(crate) struct MirrorProvider {
     tsig_signer: Option<TSigner>,
     /// Parsed nameserver address for RFC 2136 AXFR
     rfc2136_nameserver: Option<SocketAddr>,
-    /// DNS resolver for direct DNS queries
-    resolver: TokioResolver,
+    /// DNS resolver for direct DNS queries. Only initialized when the
+    /// configured source type is `dns`; for `technitium` / `rfc2136` sources
+    /// it stays `None` so Herald doesn't touch `/etc/resolv.conf` at startup.
+    resolver: Option<TokioResolver>,
     metrics: Metrics,
 }
 
@@ -67,6 +69,7 @@ impl MirrorProvider {
         let mut technitium_token: Option<String> = None;
         let mut tsig_signer: Option<TSigner> = None;
         let mut rfc2136_nameserver: Option<SocketAddr> = None;
+        let mut resolver: Option<TokioResolver> = None;
 
         match config.source.r#type.as_str() {
             "technitium" => {
@@ -90,6 +93,14 @@ impl MirrorProvider {
                         "mirror source type 'dns' does not use 'url' or 'token_file' fields"
                     );
                 }
+                // Initialize the system DNS resolver only when we'll actually
+                // use it — avoids reading /etc/resolv.conf on hosts (or build
+                // sandboxes) that don't have one.
+                resolver = Some(
+                    TokioResolver::builder_tokio()
+                        .context("initializing DNS resolver from system configuration")?
+                        .build()?,
+                );
             }
             "rfc2136" => {
                 let ns_str = config
@@ -135,11 +146,6 @@ impl MirrorProvider {
         }
 
         let client = reqwest::Client::new();
-
-        // Initialize DNS resolver from system configuration
-        let resolver = TokioResolver::builder_tokio()
-            .context("initializing DNS resolver from system configuration")?
-            .build()?;
 
         // Build the runtime transform for each rule once. This is the single
         // regex-compile site — validation deliberately does not pre-compile,
@@ -341,6 +347,10 @@ impl MirrorProvider {
     async fn poll_dns(&self) -> Result<Vec<SourceRecord>> {
         use hickory_resolver::proto::rr::RecordType;
 
+        let resolver = self
+            .resolver
+            .as_ref()
+            .context("mirror 'dns' source has no resolver initialized — this is a bug")?;
         let zone = &self.config.source.zone;
         let mut records = Vec::new();
 
@@ -355,7 +365,7 @@ impl MirrorProvider {
 
         // Query zone apex for all record types
         for record_type in query_types {
-            match self.resolver.lookup(zone.as_str(), record_type).await {
+            match resolver.lookup(zone.as_str(), record_type).await {
                 Ok(lookup) => {
                     for record in lookup.answers() {
                         if let Some(value) = extract_dns_rdata(record) {
@@ -385,7 +395,7 @@ impl MirrorProvider {
             tracing::debug!(fqdn = %fqdn, "querying subdomain");
 
             for record_type in query_types {
-                match self.resolver.lookup(fqdn.as_str(), record_type).await {
+                match resolver.lookup(fqdn.as_str(), record_type).await {
                     Ok(lookup) => {
                         for record in lookup.answers() {
                             if let Some(value) = extract_dns_rdata(record) {
@@ -582,41 +592,58 @@ impl MirrorProvider {
         *cache = records;
     }
 
-    /// Test-only constructor for a Technitium-source provider that bypasses
-    /// the async `new()` flow (token file reads, rule compilation). Used by
-    /// wiremock tests that exercise the HTTP request path in `poll_technitium`.
-    fn test_with_technitium(url: String, zone: String, token: String) -> Self {
-        use crate::config::MirrorSource;
-        let resolver = TokioResolver::builder_tokio()
-            .expect("test resolver init")
-            .build()
-            .expect("test resolver build");
-        Self {
-            name: "test-mirror".to_string(),
-            interval: Duration::from_secs(300),
-            config: MirrorProviderConfig {
-                name: None,
-                source: MirrorSource {
-                    r#type: "technitium".to_string(),
-                    url: Some(url),
-                    zone,
-                    token_file: None,
-                    subdomains: Vec::new(),
-                    nameserver: None,
-                    tsig_key_name: None,
-                },
-                rules: Vec::new(),
-                interval: "5m".to_string(),
-            },
-            compiled_transforms: Vec::new(),
+    /// Test-only constructor that builds a `MirrorProvider` directly from a
+    /// config, compiling transforms but skipping every form of I/O that
+    /// `new()` performs (token files, TSIG key loading, DNS resolver init).
+    /// Source-specific fields are left as `None`, so `poll_*` methods will
+    /// error if invoked — this helper is intended for tests that exercise
+    /// `apply_rules` / cache behavior, not polling itself.
+    pub(crate) fn test_build(config: MirrorProviderConfig) -> Result<Self> {
+        let name = config.display_name(0);
+        let interval = humantime::parse_duration(&config.interval)
+            .with_context(|| format!("test_build: invalid interval {:?}", config.interval))?;
+        let compiled_transforms = config
+            .rules
+            .iter()
+            .map(|rule| CompiledTransform::from_config(&rule.transform.kind))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            name,
+            interval,
+            config,
+            compiled_transforms,
             cached_records: Arc::new(RwLock::new(Vec::new())),
             client: reqwest::Client::new(),
-            technitium_token: Some(token),
+            technitium_token: None,
             tsig_signer: None,
             rfc2136_nameserver: None,
-            resolver,
+            resolver: None,
             metrics: Metrics::noop(),
-        }
+        })
+    }
+
+    /// Test-only constructor for a Technitium-source provider. Wraps
+    /// [`test_build`](Self::test_build) and pre-seeds the inline token so
+    /// wiremock tests can exercise the HTTP request path in `poll_technitium`.
+    fn test_with_technitium(url: String, zone: String, token: String) -> Self {
+        use crate::config::MirrorSource;
+        let config = MirrorProviderConfig {
+            name: Some("test-mirror".to_string()),
+            source: MirrorSource {
+                r#type: "technitium".to_string(),
+                url: Some(url),
+                zone,
+                token_file: None,
+                subdomains: Vec::new(),
+                nameserver: None,
+                tsig_key_name: None,
+            },
+            rules: Vec::new(),
+            interval: "5m".to_string(),
+        };
+        let mut provider = Self::test_build(config).expect("test_build");
+        provider.technitium_token = Some(token);
+        provider
     }
 }
 
@@ -958,12 +985,11 @@ mod tests {
     // ── Full apply_rules pipeline ────────────────────────────────────────────
 
     use crate::config::{MirrorMatch, MirrorRule, MirrorSource, MirrorTransform};
-    use crate::telemetry::Metrics;
 
-    /// Build a `MirrorProvider` backed by a `dns` source (no network I/O at
-    /// construction) so `apply_rules` can be exercised directly without
-    /// spinning up a fake upstream.
-    async fn build_provider(source_zone: &str, rules: Vec<MirrorRule>) -> MirrorProvider {
+    /// Build a `MirrorProvider` via `test_build` so `apply_rules` can be
+    /// exercised directly without spinning up a fake upstream or touching
+    /// `/etc/resolv.conf` — `test_build` bypasses all source-type I/O.
+    fn build_provider(source_zone: &str, rules: Vec<MirrorRule>) -> MirrorProvider {
         let cfg = MirrorProviderConfig {
             name: Some("test".to_string()),
             source: MirrorSource {
@@ -978,9 +1004,7 @@ mod tests {
             rules,
             interval: "5m".to_string(),
         };
-        MirrorProvider::new(cfg, 0, Metrics::noop())
-            .await
-            .expect("mirror provider must build")
+        MirrorProvider::test_build(cfg).expect("mirror provider must build")
     }
 
     /// Exercises the full `apply_rules` pipeline — match filtering, all three
@@ -1030,7 +1054,7 @@ mod tests {
                 },
             },
         ];
-        let provider = build_provider("internal.corp", rules).await;
+        let provider = build_provider("internal.corp", rules);
 
         let source_records = vec![
             SourceRecord {

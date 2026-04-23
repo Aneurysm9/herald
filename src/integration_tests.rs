@@ -458,25 +458,19 @@ async fn test_multiple_mirrors_contribute_distinct_records() {
     };
 
     let first = Arc::new(
-        MirrorProvider::new(
-            test_mirror_config(
-                Some("internal-dns"),
-                "internal.example.net",
-                vec![first_rule],
-            ),
-            0,
-            Metrics::noop(),
-        )
-        .await
+        MirrorProvider::test_build(test_mirror_config(
+            Some("internal-dns"),
+            "internal.example.net",
+            vec![first_rule],
+        ))
         .expect("constructing first mirror"),
     );
     let second = Arc::new(
-        MirrorProvider::new(
-            test_mirror_config(Some("corp-dns"), "corp.internal", vec![second_rule]),
-            1,
-            Metrics::noop(),
-        )
-        .await
+        MirrorProvider::test_build(test_mirror_config(
+            Some("corp-dns"),
+            "corp.internal",
+            vec![second_rule],
+        ))
         .expect("constructing second mirror"),
     );
 
@@ -535,51 +529,41 @@ async fn test_same_fqdn_across_mirrors_merges_into_rrset() {
     let backends: Vec<Arc<dyn Backend>> = vec![backend.clone()];
 
     let first = Arc::new(
-        MirrorProvider::new(
-            test_mirror_config(
-                Some("site-a"),
-                "a.internal",
-                vec![MirrorRule {
-                    r#match: MirrorMatch {
-                        r#type: None,
-                        name: None,
+        MirrorProvider::test_build(test_mirror_config(
+            Some("site-a"),
+            "a.internal",
+            vec![MirrorRule {
+                r#match: MirrorMatch {
+                    r#type: None,
+                    name: None,
+                },
+                transform: MirrorTransform {
+                    kind: MirrorTransformKind::Suffix {
+                        suffix: "example.com".to_string(),
                     },
-                    transform: MirrorTransform {
-                        kind: MirrorTransformKind::Suffix {
-                            suffix: "example.com".to_string(),
-                        },
-                        ttl: None,
-                    },
-                }],
-            ),
-            0,
-            Metrics::noop(),
-        )
-        .await
+                    ttl: None,
+                },
+            }],
+        ))
         .unwrap(),
     );
     let second = Arc::new(
-        MirrorProvider::new(
-            test_mirror_config(
-                Some("site-b"),
-                "b.internal",
-                vec![MirrorRule {
-                    r#match: MirrorMatch {
-                        r#type: None,
-                        name: None,
+        MirrorProvider::test_build(test_mirror_config(
+            Some("site-b"),
+            "b.internal",
+            vec![MirrorRule {
+                r#match: MirrorMatch {
+                    r#type: None,
+                    name: None,
+                },
+                transform: MirrorTransform {
+                    kind: MirrorTransformKind::Suffix {
+                        suffix: "example.com".to_string(),
                     },
-                    transform: MirrorTransform {
-                        kind: MirrorTransformKind::Suffix {
-                            suffix: "example.com".to_string(),
-                        },
-                        ttl: None,
-                    },
-                }],
-            ),
-            1,
-            Metrics::noop(),
-        )
-        .await
+                    ttl: None,
+                },
+            }],
+        ))
         .unwrap(),
     );
 
