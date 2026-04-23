@@ -1,6 +1,6 @@
 [package]
 name = "herald-dns"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 description = "DNS control plane for multi-provider record management with ACME challenge proxy"
 license = "MIT"

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.3.1] — 2026-04-23
+
+### Bug Fixes
+
+- Lazy-init DNS resolver so Nix sandbox builds succeed([f268383](https://github.com/Aneurysm9/herald/commit/f26838396f666807bf35c3054136fe863ad7d4b7))
+
+- Pass listZone=true when listing zone records([71f5877](https://github.com/Aneurysm9/herald/commit/71f58773703115702beb908d72e9aef136e50274))
+
+- Pass VERSION into release-hashes commit step env([b82a8bc](https://github.com/Aneurysm9/herald/commit/b82a8bc9b4f37a83df7da357bc86df0769a66618))
+
 ## [0.3.0] — 2026-04-19
 
 ### Features
