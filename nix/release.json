@@ -1,13 +1,13 @@
 {
-  "version": "0.3.0",
+  "version": "0.3.1",
   "binaries": {
     "x86_64-linux": {
-      "url": "https://github.com/Aneurysm9/herald/releases/download/v0.3.0/herald-linux-x86_64",
-      "hash": "sha256-EV7PPAXGfnm8rAc5M/Xa5b+96c0i2Vd5m6s7sEOVE4A="
+      "url": "https://github.com/Aneurysm9/herald/releases/download/v0.3.1/herald-linux-x86_64",
+      "hash": "sha256-1/qv5JoH8gMjvbHGR1JIITgkPzG9lZuzk7KnWGUmd5w="
     },
     "aarch64-linux": {
-      "url": "https://github.com/Aneurysm9/herald/releases/download/v0.3.0/herald-linux-aarch64",
-      "hash": "sha256-ojUkJN2hc0t6Et3T92/Dqd0MwFGEJnUP0t70HFtJFtQ="
+      "url": "https://github.com/Aneurysm9/herald/releases/download/v0.3.1/herald-linux-aarch64",
+      "hash": "sha256-XMgBdVKN1Cm+3+egSnLJAOPUCilib/FHNF0YcRKoQJ4="
     }
   }
 }
