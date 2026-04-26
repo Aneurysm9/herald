@@ -183,7 +183,7 @@ impl CloudflareBackend {
                     }
 
                     for cf_rec in &resp.result {
-                        match RecordValue::parse(&cf_rec.r#type, &cf_rec.content) {
+                        match parse_cf_record_value(cf_rec) {
                             Ok(value) => {
                                 all_records.push(ExistingRecord {
                                     id: cf_rec.id.clone(),
@@ -272,7 +272,7 @@ impl CloudflareBackend {
 
         let mut records = Vec::new();
         for cf_rec in &resp.result {
-            match RecordValue::parse(&cf_rec.r#type, &cf_rec.content) {
+            match parse_cf_record_value(cf_rec) {
                 Ok(value) => {
                     records.push(ExistingRecord {
                         id: cf_rec.id.clone(),
@@ -310,7 +310,7 @@ impl CloudflareBackend {
         match change {
             Change::Create(record) => {
                 let url = self.records_url_for_zone(&record.zone)?;
-                let content = record.value.value_str();
+                let (content, priority) = cf_content_and_priority(&record.value);
                 let body = CfCreateRecord {
                     r#type: record.value.type_str(),
                     name: &record.name,
@@ -318,6 +318,7 @@ impl CloudflareBackend {
                     ttl: record.ttl,
                     proxied: false,
                     comment: MANAGED_COMMENT,
+                    priority,
                 };
 
                 let resp: CfSingleResponse = self
@@ -338,7 +339,7 @@ impl CloudflareBackend {
             }
             Change::Update { id, new, .. } => {
                 let url = self.records_url_for_zone(&new.zone)?;
-                let content = new.value.value_str();
+                let (content, priority) = cf_content_and_priority(&new.value);
                 let body = CfCreateRecord {
                     r#type: new.value.type_str(),
                     name: &new.name,
@@ -346,6 +347,7 @@ impl CloudflareBackend {
                     ttl: new.ttl,
                     proxied: false,
                     comment: MANAGED_COMMENT,
+                    priority,
                 };
 
                 let resp: CfSingleResponse = self
@@ -481,6 +483,29 @@ struct CfZone {
     id: String,
 }
 
+/// Cloudflare splits MX records into a `content` field (exchange hostname) and
+/// a top-level `priority` field, while Herald's `RecordValue::MX` packs both.
+/// This helper produces the wire-format pair for `CfCreateRecord`.
+fn cf_content_and_priority(value: &RecordValue) -> (String, Option<u16>) {
+    match value {
+        RecordValue::MX { priority, exchange } => (exchange.clone(), Some(*priority)),
+        _ => (value.value_str(), None),
+    }
+}
+
+/// Inverse of [`cf_content_and_priority`] for the read path: reconstruct
+/// Herald's `priority:exchange` form for MX records before delegating to
+/// the generic parser.
+fn parse_cf_record_value(rec: &CfDnsRecord) -> Result<RecordValue> {
+    if rec.r#type == "MX" {
+        let priority = rec
+            .priority
+            .ok_or_else(|| anyhow::anyhow!("Cloudflare MX record missing priority field"))?;
+        return RecordValue::parse("MX", &format!("{priority}:{}", rec.content));
+    }
+    RecordValue::parse(&rec.r#type, &rec.content)
+}
+
 #[derive(Deserialize)]
 struct CfDnsRecord {
     id: String,
@@ -489,6 +514,8 @@ struct CfDnsRecord {
     content: String,
     ttl: u32,
     comment: Option<String>,
+    #[serde(default)]
+    priority: Option<u16>,
 }
 
 #[derive(Serialize)]
@@ -499,6 +526,8 @@ struct CfCreateRecord<'a> {
     ttl: u32,
     proxied: bool,
     comment: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    priority: Option<u16>,
 }
 
 #[cfg(test)]
@@ -909,5 +938,124 @@ mod tests {
             RecordValue::AAAA("2001:db8::1".parse().unwrap())
         );
         assert!(!records[1].managed);
+    }
+
+    #[tokio::test]
+    async fn test_apply_create_mx_sends_priority_field() {
+        let server = MockServer::start().await;
+        let backend = test_backend(&server);
+
+        Mock::given(method("POST"))
+            .and(path("/zones/zone-123/dns_records"))
+            .and(bearer_token("test-token"))
+            .and(body_partial_json(json!({
+                "type": "MX",
+                "name": "example.com",
+                "content": "mail.example.com",
+                "priority": 10,
+                "ttl": 300,
+                "proxied": false,
+                "comment": "managed-by: herald"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(cf_success_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let change = Change::Create(EnrichedRecord {
+            zone: "example.com".to_string(),
+            name: "example.com".to_string(),
+            value: RecordValue::MX {
+                priority: 10,
+                exchange: "mail.example.com".to_string(),
+            },
+            ttl: 300,
+        });
+
+        backend.apply_change_with_metrics(&change).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_apply_update_mx_sends_priority_field() {
+        let server = MockServer::start().await;
+        let backend = test_backend(&server);
+
+        Mock::given(method("PUT"))
+            .and(path("/zones/zone-123/dns_records/rec-mx-1"))
+            .and(bearer_token("test-token"))
+            .and(body_partial_json(json!({
+                "type": "MX",
+                "name": "example.com",
+                "content": "mail2.example.com",
+                "priority": 20,
+                "comment": "managed-by: herald"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(cf_success_response()))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let change = Change::Update {
+            id: "rec-mx-1".to_string(),
+            old: EnrichedRecord {
+                zone: "example.com".to_string(),
+                name: "example.com".to_string(),
+                value: RecordValue::MX {
+                    priority: 10,
+                    exchange: "mail.example.com".to_string(),
+                },
+                ttl: 300,
+            },
+            new: EnrichedRecord {
+                zone: "example.com".to_string(),
+                name: "example.com".to_string(),
+                value: RecordValue::MX {
+                    priority: 20,
+                    exchange: "mail2.example.com".to_string(),
+                },
+                ttl: 300,
+            },
+        };
+
+        backend.apply_change_with_metrics(&change).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_get_records_parses_mx_priority() {
+        let server = MockServer::start().await;
+        let backend = test_backend(&server);
+
+        Mock::given(method("GET"))
+            .and(path("/zones/zone-123/dns_records"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(cf_records_response(
+                    &json!([{
+                        "id": "rec-mx-1",
+                        "type": "MX",
+                        "name": "example.com",
+                        "content": "mail.example.com",
+                        "priority": 10,
+                        "ttl": 300,
+                        "proxied": false,
+                        "comment": "managed-by: herald"
+                    }]),
+                    1,
+                )),
+            )
+            .mount(&server)
+            .await;
+
+        let records = backend.get_records_inner().await.unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.name, "example.com");
+        assert_eq!(
+            records[0].record.value,
+            RecordValue::MX {
+                priority: 10,
+                exchange: "mail.example.com".to_string(),
+            }
+        );
+        assert!(records[0].managed);
     }
 }
