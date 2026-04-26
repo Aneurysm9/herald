@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.3.2] — 2026-04-26
+
+### Bug Fixes
+
+- Send MX priority as separate API field([7836b5b](https://github.com/Aneurysm9/herald/commit/7836b5bff945c798016f1e4657fde85541bb00ba))
+
 ## [0.3.1] — 2026-04-23
 
 ### Bug Fixes
