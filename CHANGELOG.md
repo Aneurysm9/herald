@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.3] — 2026-04-27
+
+### Bug Fixes
+
+- TSIG-sign DNS UPDATE responses (RFC 8945 §5.4)([fe345fc](https://github.com/Aneurysm9/herald/commit/fe345fc07e2c0853e5ed302e7a7123bab706ac09))
+
+- Normalize trailing dot on TSIG key_name insert([b01e7f6](https://github.com/Aneurysm9/herald/commit/b01e7f6690db279df831378e22ca231e872e5bbd))
+
 ## [0.3.2] — 2026-04-26
 
 ### Bug Fixes
