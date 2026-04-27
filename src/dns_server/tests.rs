@@ -3,7 +3,8 @@
 use crate::testing as helpers;
 use crate::testing::{
     DnsServerFixture, FIXTURE_CLIENT, FIXTURE_KEY_NAME, FIXTURE_ZONE, Prereq, TEST_TSIG_SECRET,
-    UpdateMessageBuilder, extract_rcode, make_test_tsig_key,
+    UpdateMessageBuilder, extract_rcode, extract_request_mac, extract_tsig_record,
+    make_test_tsig_key,
 };
 
 fn rdata_a_sample() -> Vec<u8> {
@@ -441,4 +442,167 @@ fn test_fixture_constants_are_coherent() {
     assert_eq!(FIXTURE_KEY_NAME, "client.example.com");
     assert_eq!(FIXTURE_CLIENT, "test-client");
     assert_eq!(FIXTURE_ZONE, "example.com");
+}
+
+// ── 5g. RFC 8945 §5.4 response signing ───────────────────────────────────
+
+#[tokio::test]
+async fn test_successful_response_carries_signed_tsig() {
+    // Per RFC 8945 §5.4 the server MUST include a TSIG record in any
+    // response to a TSIG-signed query, signed with the same key. nsupdate
+    // rejects responses without a TSIG record on signed requests with
+    // "expected a TSIG or SIG(0)", reporting NOTAUTH regardless of the
+    // actual rcode — making every successful UPDATE look like a failure.
+    let fx = DnsServerFixture::default_fixture().await;
+    let msg = UpdateMessageBuilder::new(FIXTURE_ZONE)
+        .add("host.example.com", helpers::RTYPE_A, 60, rdata_a_sample())
+        .build_signed(0x0001, &fx.key);
+    let response = fx.server.handle_message(&msg).await;
+
+    assert_eq!(
+        extract_rcode(&response),
+        0,
+        "successful UPDATE should return NOERROR"
+    );
+    let tsig = extract_tsig_record(&response)
+        .expect("response to a signed UPDATE must include a TSIG record");
+    assert_eq!(
+        tsig.data.error, None,
+        "successful response TSIG must not carry an error"
+    );
+    assert!(
+        !tsig.data.mac.is_empty(),
+        "successful response TSIG must carry a real (non-empty) MAC"
+    );
+    assert_eq!(
+        tsig.name.to_utf8().trim_end_matches('.'),
+        FIXTURE_KEY_NAME,
+        "response TSIG must use the same key name as the request"
+    );
+}
+
+#[tokio::test]
+async fn test_response_tsig_verifies_against_request_key() {
+    // Round-trip cryptographic check: the response MAC must validate when
+    // verified with the same TSigner using the request's MAC as the
+    // previous-hash chain input (RFC 8945 §5.4.1).
+    let fx = DnsServerFixture::default_fixture().await;
+    let request = UpdateMessageBuilder::new(FIXTURE_ZONE)
+        .add("verify.example.com", helpers::RTYPE_A, 60, rdata_a_sample())
+        .build_signed(0x4242, &fx.key);
+    let request_mac = extract_request_mac(&request);
+
+    let response = fx.server.handle_message(&request).await;
+    assert_eq!(extract_rcode(&response), 0);
+
+    // hickory's TSigVerifier passes `first_message=true` for the first
+    // response in a chain (and Some(request_mac) as previous-hash). This
+    // matches the TBS layout produced by `encode_response_tbs`.
+    fx.key
+        .verify_message_byte(&response, Some(&request_mac), true)
+        .expect("response TSIG must verify against the request key + request MAC");
+}
+
+#[tokio::test]
+async fn test_bad_mac_response_carries_badsig_error() {
+    // Per RFC 8945 §5.3.2 a bad-MAC response is unsigned but MUST still
+    // carry a stub TSIG with TSIG ERROR 16 (BADSIG) so the client can
+    // distinguish "MAC failed" from "no TSIG processing happened at all".
+    let fx = DnsServerFixture::default_fixture().await;
+    let mut msg = UpdateMessageBuilder::new(FIXTURE_ZONE)
+        .add(
+            format!("host.{FIXTURE_ZONE}"),
+            helpers::RTYPE_A,
+            60,
+            rdata_a_sample(),
+        )
+        .build_signed(0x0001, &fx.key);
+    let flip = msg.len() - 10;
+    msg[flip] ^= 0x80;
+
+    let response = fx.server.handle_message(&msg).await;
+    assert_eq!(extract_rcode(&response), 9); // NOTAUTH
+
+    let tsig = extract_tsig_record(&response)
+        .expect("bad-MAC response must still include a TSIG record (with BADSIG error)");
+    assert_eq!(
+        tsig.data.error,
+        Some(hickory_proto::rr::rdata::tsig::TsigError::BadSig),
+        "bad-MAC response TSIG must carry BADSIG error"
+    );
+    assert!(
+        tsig.data.mac.is_empty(),
+        "bad-MAC response TSIG must NOT carry a real MAC (RFC 8945 §5.3.2: response is unsigned)"
+    );
+}
+
+#[tokio::test]
+async fn test_unknown_key_response_carries_badkey_error() {
+    // Per RFC 8945 §5.3.2 an unknown-key response is unsigned but MUST
+    // carry a stub TSIG with TSIG ERROR 17 (BADKEY).
+    let fx = DnsServerFixture::default_fixture().await;
+    let wrong_key = make_test_tsig_key("other.example.com", TEST_TSIG_SECRET);
+    let msg = UpdateMessageBuilder::new(FIXTURE_ZONE)
+        .add(
+            format!("host.{FIXTURE_ZONE}"),
+            helpers::RTYPE_A,
+            60,
+            rdata_a_sample(),
+        )
+        .build_signed(0x0001, &wrong_key);
+
+    let response = fx.server.handle_message(&msg).await;
+    assert_eq!(extract_rcode(&response), 9);
+
+    let tsig = extract_tsig_record(&response)
+        .expect("unknown-key response must include a stub TSIG record (with BADKEY error)");
+    assert_eq!(
+        tsig.data.error,
+        Some(hickory_proto::rr::rdata::tsig::TsigError::BadKey),
+        "unknown-key response TSIG must carry BADKEY error"
+    );
+    assert!(
+        tsig.data.mac.is_empty(),
+        "unknown-key response TSIG must NOT carry a real MAC"
+    );
+}
+
+#[tokio::test]
+async fn test_unsigned_request_response_has_no_tsig() {
+    // No TSIG in the request → no key to sign with, no need for a TSIG
+    // stub. The response is a plain unsigned NotAuth.
+    let fx = DnsServerFixture::default_fixture().await;
+    let msg = UpdateMessageBuilder::new(FIXTURE_ZONE)
+        .add(
+            format!("host.{FIXTURE_ZONE}"),
+            helpers::RTYPE_A,
+            60,
+            rdata_a_sample(),
+        )
+        .build(0x0001);
+    let response = fx.server.handle_message(&msg).await;
+    assert_eq!(extract_rcode(&response), 9);
+    assert!(
+        extract_tsig_record(&response).is_none(),
+        "response to an unsigned request must not carry a TSIG record"
+    );
+}
+
+#[tokio::test]
+async fn test_response_id_matches_request_in_signed_response() {
+    // Guard: ensure response signing does not corrupt the message ID.
+    let fx = DnsServerFixture::default_fixture().await;
+    let id = 0xCAFE;
+    let msg = UpdateMessageBuilder::new(FIXTURE_ZONE)
+        .add(
+            "id-check.example.com",
+            helpers::RTYPE_A,
+            60,
+            rdata_a_sample(),
+        )
+        .build_signed(id, &fx.key);
+    let response = fx.server.handle_message(&msg).await;
+    assert_eq!(u16::from_be_bytes([response[0], response[1]]), id);
+    assert_eq!(extract_rcode(&response), 0);
+    assert!(extract_tsig_record(&response).is_some());
 }

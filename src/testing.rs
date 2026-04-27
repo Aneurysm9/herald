@@ -436,6 +436,22 @@ pub(crate) fn extract_opcode(response: &[u8]) -> u8 {
     (response[2] >> 3) & 0x0F
 }
 
+/// Parse the TSIG record (if any) attached to a response.
+pub(crate) fn extract_tsig_record(
+    response: &[u8],
+) -> Option<hickory_proto::rr::Record<hickory_proto::rr::rdata::TSIG>> {
+    let parsed = hickory_proto::op::Message::from_vec(response).ok()?;
+    parsed.signature.map(|boxed| *boxed)
+}
+
+/// Extract the request MAC from a signed message (for response verification).
+pub(crate) fn extract_request_mac(signed_msg: &[u8]) -> Vec<u8> {
+    let parsed =
+        hickory_proto::op::Message::from_vec(signed_msg).expect("signed message must parse");
+    let tsig = parsed.signature.expect("signed message must carry a TSIG");
+    tsig.data.mac.clone()
+}
+
 // ── FakeBackend ──────────────────────────────────────────────────────────────
 
 /// `Backend` impl for tests. When `provider` is set, `get_records()` returns

@@ -1,13 +1,53 @@
 use anyhow::{Context, Result};
 use hickory_proto::op::{Message, OpCode, ResponseCode};
+use hickory_proto::rr::TSigResponseContext;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-/// Build a minimal DNS response (header only, all counts zero).
-pub(super) fn build_response(id: u16, opcode: OpCode, rcode: ResponseCode) -> Vec<u8> {
-    let msg = Message::error_msg(id, opcode, rcode);
+/// Build a DNS response, optionally signing it with TSIG per RFC 8945 §5.4.
+///
+/// When `sign_context` is `Some`, the response carries the TSIG record
+/// dictated by the supplied context (signed success, signed BADTIME,
+/// unsigned BADSIG stub, or unsigned BADKEY stub). When `None`, the
+/// response is plain (used for messages that arrived without TSIG, for
+/// pre-parse FORMERR, and for non-UPDATE opcodes).
+pub(super) fn build_response(
+    id: u16,
+    opcode: OpCode,
+    rcode: ResponseCode,
+    sign_context: Option<TSigResponseContext>,
+) -> Vec<u8> {
+    let mut msg = Message::error_msg(id, opcode, rcode);
+
+    if let Some(ctx) = sign_context {
+        // hickory's encode_response_tbs hashes the request MAC, the
+        // unsigned response wire-bytes, and the stub TSIG together.
+        // Serialize once unsigned, sign, attach, then serialize again so
+        // hickory writes the TSIG into the additional section and bumps
+        // ARCOUNT.
+        match msg.to_vec() {
+            Ok(unsigned_bytes) => match ctx.sign(&unsigned_bytes) {
+                Ok(tsig_record) => {
+                    msg.signature = Some(tsig_record);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = ?e,
+                        "failed to sign DNS UPDATE response; sending unsigned"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = ?e,
+                    "failed to serialize DNS UPDATE response for signing"
+                );
+            }
+        }
+    }
+
     msg.to_vec().unwrap_or_else(|_| {
-        // Fallback: hand-rolled 12-byte header if serialization fails.
+        // Fallback: hand-rolled 12-byte header if hickory serialization fails.
         let op_val = u8::from(opcode);
         let rcode_val = rcode.low();
         let flags: u16 = 0x8000 | (u16::from(op_val) << 11) | u16::from(rcode_val);
