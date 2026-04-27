@@ -48,6 +48,16 @@ use std::time::Instant;
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Notify;
 
+/// Normalize a TSIG key name by stripping a single trailing dot.
+///
+/// `tsig-keygen` output and BIND/nsupdate examples use canonical FQDNs
+/// (with trailing dot); the wire form likewise places the trailing dot
+/// in the TSIG record name. Lookup uses the dot-stripped form, so insert
+/// must match — otherwise dotted config keys silently mismatch.
+fn normalize_key_name(name: &str) -> &str {
+    name.strip_suffix('.').unwrap_or(name)
+}
+
 /// DNS UPDATE receiver that feeds incoming records into the dynamic provider.
 pub(crate) struct DnsServer {
     /// Map from TSIG key name to `(signer, client_name)`.
@@ -104,7 +114,7 @@ impl DnsServer {
                 "DNS server TSIG key loaded"
             );
             tsig_signers.insert(
-                key_config.key_name.clone(),
+                normalize_key_name(&key_config.key_name).to_string(),
                 (signer, key_config.client.clone()),
             );
         }
@@ -136,7 +146,7 @@ impl DnsServer {
 
         let mut tsig_signers = HashMap::new();
         for (name, signer, client) in signers {
-            tsig_signers.insert(name, (signer, client));
+            tsig_signers.insert(normalize_key_name(&name).to_string(), (signer, client));
         }
 
         Ok(Self {
@@ -304,10 +314,14 @@ impl DnsServer {
             })
             .ok_or(DnsError::NotAuth)?;
 
-        let (signer, client_name) = self
-            .tsig_signers
-            .get(key_name.as_str())
-            .ok_or(DnsError::NotAuth)?;
+        let Some((signer, client_name)) = self.tsig_signers.get(key_name.as_str()) else {
+            tracing::debug!(
+                attempted = %key_name,
+                configured = ?self.tsig_signers.keys().collect::<Vec<_>>(),
+                "TSIG key lookup miss"
+            );
+            return Err(DnsError::NotAuth);
+        };
 
         // Verify the TSIG MAC against the raw bytes.
         let now = std::time::SystemTime::now()

@@ -561,6 +561,60 @@ impl DnsServerFixture {
         Self::build_with_clients(backend_zones, clients).await
     }
 
+    /// Build a default fixture but register the TSIG key under `key_name`
+    /// (instead of the canonical `FIXTURE_KEY_NAME`). Used to exercise
+    /// trailing-dot / hostname-variant insert behaviour.
+    #[allow(clippy::unused_async)]
+    pub(crate) async fn build_with_key_name(key_name: &str) -> Self {
+        let mut clients = HashMap::new();
+        clients.insert(
+            FIXTURE_CLIENT.to_string(),
+            DynamicClientConfig {
+                allowed_domains: vec![format!("*.{FIXTURE_ZONE}"), FIXTURE_ZONE.to_string()],
+                allowed_zones: vec![FIXTURE_ZONE.to_string()],
+                rate_limit: None,
+            },
+        );
+        let dynamic_provider = Arc::new(
+            DynamicProvider::new(DynamicProviderConfig { clients }, None, Metrics::noop())
+                .expect("in-memory DynamicProvider should always construct"),
+        );
+
+        let backends: Vec<Arc<dyn Backend>> = vec![FakeBackend::arc_with_provider(
+            "fake",
+            vec![FIXTURE_ZONE.to_string()],
+            Arc::clone(&dynamic_provider),
+        )];
+
+        let key = make_test_tsig_key(key_name, TEST_TSIG_SECRET);
+        let reconcile_notify = Arc::new(Notify::new());
+
+        let dns_config = DnsServerConfig {
+            listen: "[::]:0".to_string(),
+            tsig_keys: Vec::new(),
+        };
+
+        let server = DnsServer::from_tsig_signers_for_test(
+            &dns_config,
+            vec![(
+                key_name.to_string(),
+                make_test_tsig_key(key_name, TEST_TSIG_SECRET),
+                FIXTURE_CLIENT.to_string(),
+            )],
+            Arc::clone(&dynamic_provider),
+            backends,
+            Arc::clone(&reconcile_notify),
+        )
+        .expect("DnsServer test constructor should succeed");
+
+        Self {
+            server,
+            dynamic_provider,
+            key,
+            reconcile_notify,
+        }
+    }
+
     #[allow(clippy::unused_async)]
     pub(crate) async fn build_with_clients(
         backend_zones: Vec<String>,

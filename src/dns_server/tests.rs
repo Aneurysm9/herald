@@ -97,6 +97,30 @@ async fn test_time_skew_past_fudge_returns_notauth() {
     assert!(fx.current_records().await.is_empty());
 }
 
+#[tokio::test]
+async fn test_key_name_with_trailing_dot_authenticates() {
+    // tsig-keygen and BIND/nsupdate examples produce/use FQDNs with a
+    // trailing dot (e.g. "client.example.com."). Operators copy that form
+    // verbatim into Herald's `tsig_keys[].key_name`. Lookup strips the
+    // trailing dot from the wire-format key name, so insert must do the
+    // same — otherwise every signed UPDATE returns NOTAUTH.
+    let fx = DnsServerFixture::build_with_key_name("client.example.com.").await;
+    let msg = UpdateMessageBuilder::new(FIXTURE_ZONE)
+        .add(
+            format!("host.{FIXTURE_ZONE}"),
+            helpers::RTYPE_A,
+            60,
+            rdata_a_sample(),
+        )
+        .build_signed(0x0001, &fx.key);
+    let response = fx.server.handle_message(&msg).await;
+    assert_eq!(
+        extract_rcode(&response),
+        0,
+        "trailing-dot key_name should authenticate after insert-side normalization"
+    );
+}
+
 // ── 5b. Opcode dispatch ───────────────────────────────────────────────────
 
 #[tokio::test]
