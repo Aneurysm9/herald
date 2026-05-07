@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.4.0] — 2026-05-07
+
+### Features
+
+- Remove mirror provider in favor of RFC 2136 receiver([a074e34](https://github.com/Aneurysm9/herald/commit/a074e34f43a6d31f5317891dd6aef860734d0942)) **BREAKING**
+
 ## [0.3.3] — 2026-04-27
 
 ### Bug Fixes
