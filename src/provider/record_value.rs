@@ -51,7 +51,7 @@ impl RecordValue {
     /// Parse a record value from a type string and value string.
     ///
     /// This is the single boundary parsing function — call it wherever raw strings
-    /// enter Herald (backend API responses, mirror sources, API requests, config).
+    /// enter Herald (backend API responses, API requests, config).
     ///
     /// # Errors
     ///

@@ -1,7 +1,7 @@
 //! TSIG key loading for RFC 2845/8945 authentication.
 //!
-//! Shared by the RFC 2136 backend (outbound signing), the DNS UPDATE receiver
-//! (inbound verification), and the AXFR mirror source (query signing).
+//! Shared by the RFC 2136 backend (outbound signing) and the DNS UPDATE
+//! receiver (inbound verification).
 //!
 //! # hickory-dns 0.26 API notes
 //!

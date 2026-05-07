@@ -125,13 +125,11 @@ impl Provider for MyProvider {
 All public items should have rustdoc comments:
 
 ```rust
-/// Polls the source DNS server and updates cached records.
+/// Reconciles the desired record set against the backend.
 ///
-/// This runs on a schedule (configured via `mirror.interval`) and:
-/// 1. Fetches all records from the source
-/// 2. Applies transformation rules
-/// 3. Updates the internal cache
-pub async fn poll(&self) -> Result<()> {
+/// Diffs `desired` against the backend's current state and emits
+/// the create/update/delete `Change`s needed to converge.
+pub async fn reconcile(&self, desired: &[DesiredRecord]) -> Result<Vec<Change>> {
     // implementation
 }
 ```
@@ -445,7 +443,7 @@ and record sets via the AWS SDK.
 ```
 
 ```
-fix: handle empty mirror poll responses gracefully
+fix: handle empty Technitium API responses gracefully
 
 Previously, an empty Technitium API response would cause a panic. Now
 returns an empty record set and logs a warning.
@@ -495,22 +493,18 @@ Include in your PR description:
 ```markdown
 ## Summary
 
-Adds support for DNS mirroring from Technitium DNS Server.
+Adds Technitium DNS Server as a backend target.
 
 ## Changes
 
-- New `MirrorProvider` that polls Technitium API on a configurable interval
-- Name transformation rules (suffix replacement, glob matching)
-- Config schema for `providers.mirror`
+- New `TechnitiumBackend` implementing the `Backend` trait
+- Config schema for `backends.technitium` with multi-instance support
+- Managed-record tagging via the `comments` field
 
 ## Testing
 
-- Unit tests for `transform_name`, `glob_match`, `apply_rules`
-- Integration test with wiremock mocking Technitium API responses
-
-## Notes
-
-The `poll_dns` method is stubbed for future raw DNS zone transfer support.
+- Unit tests for record CRUD against a mocked Technitium API
+- Integration test with wiremock covering create/update/delete flows
 ```
 
 ### CI Checks

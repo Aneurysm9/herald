@@ -1,7 +1,6 @@
 //! Shared utilities for interacting with the Technitium DNS Server API.
 //!
-//! This module provides common types and functions used by both the mirror provider
-//! (which reads from Technitium) and the Technitium backend (which writes to it).
+//! Provides response-shape types used by the Technitium backend.
 
 use serde::Deserialize;
 

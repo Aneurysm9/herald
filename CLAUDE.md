@@ -36,15 +36,13 @@ The Nix formatter is **alejandra**.
 
 Herald is a DNS control plane service that manages DNS records across multiple DNS backends (Cloudflare, Technitium DNS Server) with fine-grained control. It is a Rust service deployed as a single static binary on NixOS.
 
-### Four use cases
+### Three use cases
 
 1. **ACME challenge proxy** — per-service scoped tokens for DNS-01 certificate validation. Services call Herald's API to set/clear `_acme-challenge` TXT records. Each service has its own token and can only manage challenges for its allowed domains.
 
 2. **Declarative static records** — infrastructure-as-code DNS records defined in Herald's config file and reconciled to Cloudflare.
 
-3. **Dynamic DNS mirroring** — poll internal Technitium DNS zones (e.g., AAAA records from DHCPv6/RA in `internal.example.com`), mirror selected records to Cloudflare under different names (e.g., `host.example.org`). Internal zone structure is never exposed publicly.
-
-4. **Dynamic DNS records** — API-driven DNS record management for systems like OPNsense. Authenticated clients can create, update, and delete arbitrary DNS records with fine-grained domain and zone permission scoping.
+3. **Dynamic DNS records** — API-driven DNS record management (HTTP API and RFC 2136 DNS UPDATE) for systems like OPNsense. Authenticated clients can create, update, and delete arbitrary DNS records with fine-grained domain and zone permission scoping. Operators who need to import records from another DNS source can do so externally with `nsupdate` (or any RFC 2136 client) feeding Herald's DNS UPDATE receiver.
 
 ## Architecture
 
@@ -52,7 +50,6 @@ Herald is a DNS control plane service that manages DNS records across multiple D
 herald
 ├── Providers (sources of desired records)
 │   ├── static    — records from config file
-│   ├── mirror    — poll a DNS source, transform names, filter types
 │   ├── acme      — ephemeral TXT records from API, per-client scoped
 │   ├── dynamic   — API-driven records, per-client domain/zone scoped
 │   └── (future)  — webhook, Kubernetes, etc.
@@ -79,7 +76,6 @@ herald
 - **Provider pattern**: Each provider implements the `Provider` trait and contributes `Vec<DnsRecord>` to a unified desired-state set. Providers are independent and composable.
 - **Reconciliation, not imperative**: The reconciler diffs desired vs actual and converges. Safe to re-run. Supports dry-run mode.
 - **ACME is just a provider**: Challenge TXT records are ephemeral entries in the desired state, added/removed via API. They participate in the same reconciliation loop as all other records.
-- **DNS mirroring**: The mirror provider polls a DNS source, applies transformation rules (rename, filter by type/name), and contributes to desired state. Runs on a configurable schedule.
 - **Zone-agnostic providers**: Providers declare records by FQDN only. The reconciler derives the zone from the FQDN using backend zone declarations via longest suffix matching. This decouples providers from backend topology.
 - **Multi-backend support**: Multiple backends can be configured, each managing a distinct set of zones. Zones cannot overlap between backends.
 
@@ -113,7 +109,6 @@ src/
 ├── provider/
 │   ├── mod.rs        — Provider trait, DnsRecord type, shared utilities
 │   ├── static.rs     — Static records from config
-│   ├── mirror.rs     — DNS mirroring with name transformation
 │   ├── acme.rs       — Ephemeral ACME challenge records
 │   └── dynamic.rs    — API-driven DNS records with permission scoping
 ├── backend/
@@ -125,7 +120,7 @@ src/
 ├── reconciler/
 │   └── mod.rs         — Desired vs actual diff + change application
 ├── dns_server.rs      — RFC 2136 DNS UPDATE receiver (nsupdate-compatible server)
-├── tsig.rs            — TSIG key loading (shared by backend, receiver, mirror)
+├── tsig.rs            — TSIG key loading (shared by backend and receiver)
 └── zone_util.rs       — Zone derivation (longest-suffix matching)
 ```
 
@@ -188,70 +183,6 @@ providers:
         type: A
         value: "203.0.113.1"
         ttl: 300
-
-  # Mirror records from internal DNS.
-  #
-  # `mirror` is a LIST — multiple mirror instances can run side-by-side, each
-  # with its own source, rule set, and polling interval. Each entry may
-  # specify an optional `name` for logs and metrics; if omitted it falls
-  # back to `mirror[{index}]`.
-  mirror:
-    - name: "internal-technitium"          # optional; used in logs/metrics
-      source:
-        type: technitium                   # Technitium API (requires API access)
-        url: "http://ns01.internal.example.com:5380"
-        zone: "internal.example.com"
-        token_file: "/run/secrets/herald_technitium_token"
-      rules:
-        - match:
-            type: AAAA                     # only AAAA records
-          transform:
-            type: suffix                   # replace source zone suffix
-            suffix: "example.org"
-            ttl: 600                       # optional: override default 300s TTL
-        - match:
-            type: A
-            name: "*.internal.example.com"
-          transform:
-            type: suffix
-            suffix: "example.org"
-      interval: "5m"
-
-    - name: "corp-axfr"
-      source:
-        type: rfc2136                      # AXFR zone transfer
-        zone: "corp.internal"
-        nameserver: "ns1.corp.internal:53"
-        token_file: "/run/secrets/tsig_key"      # optional TSIG for AXFR auth
-        tsig_key_name: "axfr.corp.internal"
-      rules:
-        # `rename` replaces the full FQDN for a specific record.
-        - match:
-            type: A
-            name: "db-primary.corp.internal"
-          transform:
-            type: rename
-            to: "db.example.org"
-        # `regex` applies a pattern with capture-group replacement.
-        - match: {}
-          transform:
-            type: regex
-            pattern: '^(.+)\.legacy\.corp\.internal$'
-            replacement: '$1.public.example.org'
-      interval: "1m"
-
-    # A third entry using direct DNS queries against any server, without
-    # API access. `subdomains` lists names to query beyond the zone apex.
-    - source:                              # no name → falls back to `mirror[2]`
-        type: dns
-        zone: "internal.example.com"
-        subdomains:
-          - "host1"
-          - "host2"
-      rules:
-        - match: { type: A }
-          transform: { type: suffix, suffix: "example.org" }
-      interval: "10m"
 
   # ACME DNS-01 challenge proxy
   acme:
@@ -450,7 +381,7 @@ When a provider fails, its records are omitted and a `warnings` array is include
 ```json
 {
   "records": [...],
-  "warnings": ["provider 'mirror' failed: connection refused"]
+  "warnings": ["provider 'static' failed: I/O error"]
 }
 ```
 
@@ -656,7 +587,7 @@ Note: Herald manages DNS records only (proxied: false). Proxied records require 
 
 ## Technitium API Reference
 
-Herald's mirror provider and Technitium backend use the Technitium DNS Server HTTP API.
+Herald's Technitium backend uses the Technitium DNS Server HTTP API.
 
 ### Authentication
 Pass `token=<api_token>` as a query parameter on every request.
@@ -695,7 +626,7 @@ The `rData` structure varies by record type:
 
 ### Backend-Specific Endpoints
 
-When using Technitium as a backend (not just a mirror source), Herald creates, updates, and deletes records:
+When using Technitium as a backend, Herald creates, updates, and deletes records:
 
 **Create/Update parameters** (POST `/api/zones/records/add`):
 - `token` — API token
@@ -713,33 +644,6 @@ When using Technitium as a backend (not just a mirror source), Herald creates, u
 **Managed Record Tracking**: Like Cloudflare, Technitium supports a `comments` field. Herald tags all created records with `"managed-by: herald"` and only modifies/deletes records with this tag. This prevents Herald from touching manually-created records.
 
 **MX Record Format**: Herald stores MX records internally as `"preference:exchange"` (e.g., `"10:mail.example.com"`). When creating/deleting via Technitium API, this is split into separate `preference` and `exchange` parameters.
-
-## AAAA Mirroring Flow (Example)
-
-### Technitium API Source
-
-1. Mirror provider queries Technitium: `GET /api/zones/records/get?token=T&domain=internal.example.com&zone=internal.example.com`
-2. Response includes: `myhost.internal.example.com AAAA 2001:db8::1`
-3. Rule matches: type=AAAA, transform suffix=example.org
-4. Provider contributes: `myhost.example.org AAAA 2001:db8::1` to desired state
-5. Reconciler compares with Cloudflare actual state
-6. If record doesn't exist or value differs → CREATE or UPDATE at Cloudflare
-7. External clients: `dig myhost.example.org AAAA` → `2001:db8::1`
-8. Internal hostnames (`internal.example.com`) never appear in public DNS
-
-### DNS Lookup Source
-
-1. Mirror provider queries DNS: A, AAAA, CNAME, TXT, MX lookups for `internal.example.com` and configured subdomains
-2. Example response: `myhost.internal.example.com AAAA 2001:db8::1`
-3. Rule matches: type=AAAA, transform suffix=example.org
-4. Provider contributes: `myhost.example.org AAAA 2001:db8::1` to desired state
-5. Same reconciliation flow as above
-
-**DNS Lookup Limitations:**
-- Cannot enumerate all records in a zone (no AXFR/zone transfer support)
-- Only queries zone apex and explicitly configured subdomains
-- Use `subdomains: ["host1", "host2"]` in config to query specific hosts
-- Works with any DNS server (authoritative or recursive) without API access
 
 ## Managed Record Tracking
 
@@ -765,7 +669,6 @@ Herald needs to distinguish records it manages from records created manually at 
 ## Testing Strategy
 
 ### Unit tests
-- `provider::mirror::tests` — name transformation, glob matching, rule application
 - `provider::acme` — permission checking, challenge set/clear logic
 - `provider::static` — config parsing to DnsRecord conversion
 - `reconciler` — diff logic (create/update/delete detection) with mock backends
@@ -787,17 +690,15 @@ Herald needs to distinguish records it manages from records created manually at 
 1. ✅ **Config loading + main startup loop** — binary runs as systemd service
 2. ✅ **Static provider + Cloudflare backend + Reconciler** — end-to-end for static records
 3. ✅ **ACME provider + API server** — challenge set/clear flow
-4. ✅ **Mirror provider (Technitium + DNS)** — DNS mirroring from internal zones
-5. ✅ **Dynamic DNS provider** — API-driven record management (OPNsense integration)
-6. ✅ **Managed record tracking** — comment-based tagging for both Cloudflare and Technitium
-7. ✅ **Scheduling** — periodic reconciliation and mirror polling
-8. ✅ **Technitium backend** — Technitium DNS Server as a backend target (in addition to Cloudflare)
-9. ✅ **Persistence** — SQLite storage for dynamic DNS and ACME challenges
-10. ✅ **RFC 2136 backend** — DNS UPDATE to BIND/Knot/etc., SQLite managed-record tracking
-11. ✅ **RFC 2136 mirror source** — AXFR zone transfer as a mirror source type (`type: rfc2136`)
-12. ✅ **DNS UPDATE receiver** — nsupdate-compatible server with full prerequisite evaluation, feeds into dynamic provider
-13. ✅ **RFC 2136 backend prerequisites** — compare-and-swap for UPDATE, existence checks for CREATE, DNS query resync on drift
-14. ✅ **Targeted prerequisite queries** — `get_records_by_name` trait method for efficient per-name backend queries
+4. ✅ **Dynamic DNS provider** — API-driven record management (OPNsense integration)
+5. ✅ **Managed record tracking** — comment-based tagging for both Cloudflare and Technitium
+6. ✅ **Scheduling** — periodic reconciliation
+7. ✅ **Technitium backend** — Technitium DNS Server as a backend target (in addition to Cloudflare)
+8. ✅ **Persistence** — SQLite storage for dynamic DNS and ACME challenges
+9. ✅ **RFC 2136 backend** — DNS UPDATE to BIND/Knot/etc., SQLite managed-record tracking
+10. ✅ **DNS UPDATE receiver** — nsupdate-compatible server with full prerequisite evaluation, feeds into dynamic provider
+11. ✅ **RFC 2136 backend prerequisites** — compare-and-swap for UPDATE, existence checks for CREATE, DNS query resync on drift
+12. ✅ **Targeted prerequisite queries** — `get_records_by_name` trait method for efficient per-name backend queries
 
 **Future:**
 - Metrics / observability — OpenTelemetry metrics are partially implemented, could expand

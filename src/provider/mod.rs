@@ -1,6 +1,5 @@
 pub(crate) mod acme;
 pub(crate) mod dynamic;
-pub(crate) mod mirror;
 pub(crate) mod record_value;
 pub(crate) mod r#static;
 
@@ -134,8 +133,8 @@ impl<T: Named> Named for Arc<T> {
 }
 
 /// Blanket impl so `Arc<T: Provider>` can be used as `Box<dyn Provider>`.
-/// This is needed because `AcmeProvider` and `MirrorProvider` are shared
-/// between background tasks and the provider list.
+/// This is needed because `AcmeProvider` is shared between background tasks
+/// and the provider list.
 impl<T: Provider> Provider for Arc<T> {
     fn records(&self) -> Pin<Box<dyn Future<Output = Result<Vec<DesiredRecord>>> + Send + '_>> {
         T::records(self)

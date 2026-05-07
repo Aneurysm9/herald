@@ -36,11 +36,6 @@ pub(crate) struct Metrics {
     pub acme_challenges_active: UpDownCounter<i64>,
     pub acme_operations: Counter<u64>,
 
-    // Mirror
-    pub mirror_polls: Counter<u64>,
-    pub mirror_poll_duration: Histogram<f64>,
-    pub mirror_records: Gauge<u64>,
-
     // Dynamic DNS
     pub dynamic_operations: Counter<u64>,
     pub dynamic_records_active: Gauge<u64>,
@@ -135,19 +130,6 @@ impl Metrics {
             acme_operations: meter
                 .u64_counter("herald.acme.operations")
                 .with_description("Number of ACME operations")
-                .build(),
-            mirror_polls: meter
-                .u64_counter("herald.mirror.polls")
-                .with_description("Number of mirror poll operations")
-                .build(),
-            mirror_poll_duration: meter
-                .f64_histogram("herald.mirror.poll_duration")
-                .with_description("Duration of mirror polls")
-                .with_unit("s")
-                .build(),
-            mirror_records: meter
-                .u64_gauge("herald.mirror.records")
-                .with_description("Number of mirrored records")
                 .build(),
             dynamic_operations: meter
                 .u64_counter("herald.dynamic.operations")

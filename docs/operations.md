@@ -51,32 +51,6 @@ Herald includes a NixOS module (`services.herald`) in the [nixos repo](https://g
           }
         ];
 
-        # `mirror` is a LIST — one entry per mirror instance. Each entry may
-        # optionally set `name` for logs/metrics; otherwise falls back to
-        # `mirror[{index}]`.
-        mirror = [
-          {
-            name = "internal-technitium";
-            source = {
-              type = "technitium";
-              url = "http://ns01.internal.example.org:5380";
-              zone = "internal.example.org";
-              token_file = config.sops.secrets.herald_technitium_token.path;
-            };
-            rules = [
-              {
-                match.type = "AAAA";
-                transform = {
-                  type = "suffix";
-                  suffix = "example.com";
-                  ttl = 600;          # optional per-rule TTL override
-                };
-              }
-            ];
-            interval = "5m";
-          }
-        ];
-
         acme = {
           zone = "example.com";
           domain = "acme.example.com";
@@ -209,19 +183,6 @@ All configuration keys with types, defaults, and environment variable overrides.
 | `backends.cloudflare.zones` | array | (required) | (not supported) | List of Cloudflare zone names to manage |
 | `backends.cloudflare.token_file` | string | (required) | `HERALD_BACKENDS_CLOUDFLARE_TOKEN_FILE` | Path to Cloudflare API token file |
 | `providers.static.records` | array | `[]` | (not supported) | Static DNS records to manage |
-| `providers.mirror` | array | `[]` | — | List of mirror instances; each has its own source, rules, and interval |
-| `providers.mirror[].name` | string | (optional) | — | Instance name for logs and metrics (falls back to `mirror[{index}]`) |
-| `providers.mirror[].source.type` | string | — | — | Mirror source type: `technitium`, `dns`, or `rfc2136` |
-| `providers.mirror[].source.url` | string | — | — | Source API URL (Technitium only) |
-| `providers.mirror[].source.zone` | string | — | — | Source zone to mirror |
-| `providers.mirror[].source.token_file` | string | — | — | API token file (Technitium) or base64 TSIG secret (rfc2136) |
-| `providers.mirror[].source.nameserver` | string | — | — | Authoritative server for AXFR (rfc2136 only, `host:port`) |
-| `providers.mirror[].source.tsig_key_name` | string | — | — | TSIG key name for AXFR auth (rfc2136 only) |
-| `providers.mirror[].source.subdomains` | array | `[]` | — | Subdomains to query beyond the apex (dns only) |
-| `providers.mirror[].rules` | array | — | — | Transformation rules (match + transform); at least one required |
-| `providers.mirror[].rules[].transform.type` | string | — | — | Transform kind: `suffix`, `rename`, or `regex` |
-| `providers.mirror[].rules[].transform.ttl` | int | `300` | — | Optional per-rule TTL override for contributed records |
-| `providers.mirror[].interval` | string | `"5m"` | — | Polling interval for this instance |
 | `providers.acme.zone` | string | (required if acme enabled) | — | Target zone for ACME challenges |
 | `providers.acme.domain` | string | (required if acme enabled) | — | Base domain for ACME challenges |
 | `providers.acme.clients` | map | — | — | Client configurations with allowed_domains |
@@ -423,9 +384,6 @@ All metrics use the `herald.*` namespace. 14 metrics are exported:
 | `herald.provider.errors` | Counter | `provider` | Number of provider errors |
 | `herald.acme.challenges.active` | UpDownCounter | — | Number of active ACME challenges |
 | `herald.acme.operations` | Counter | `operation`, `status` | ACME operations (`operation=set/clear`, `status=success/error`) |
-| `herald.mirror.polls` | Counter | `mirror`, `status` | Number of mirror poll operations; `mirror` attribute carries the per-instance name (e.g., `internal-technitium`, `mirror[1]`) |
-| `herald.mirror.poll_duration` | Histogram | `mirror` | Duration of mirror polls (seconds), labeled by instance name |
-| `herald.mirror.records` | Gauge | `mirror` | Number of mirrored records contributed by each instance |
 | `herald.dynamic.operations` | Counter | `operation`, `status` | Dynamic DNS operations (`operation=set/delete`, `status=success/error`) |
 | `herald.dynamic.records.active` | Gauge | — | Number of active dynamic DNS records |
 | `herald.backend.api_calls` | Counter | `operation`, `status` | Backend API calls (`operation=get_records/create/update/delete`, `status=success/error`) |
@@ -752,35 +710,6 @@ Herald connects outbound to the primary nameserver on TCP port 53 (or the config
 - Herald host can reach the nameserver on TCP/53
 - The nameserver's ACL allows updates from Herald's IP
 
-### Mirror source (AXFR zone transfer)
-
-The RFC 2136 mirror source type uses AXFR zone transfer to enumerate all records in a zone, without requiring API access:
-
-```yaml
-providers:
-  mirror:
-    - name: "internal-axfr"
-      source:
-        type: rfc2136
-        zone: "internal.example.com"
-        nameserver: "ns1.internal.example.com:53"
-        token_file: "/run/secrets/axfr_key"      # optional TSIG for AXFR authentication
-        tsig_key_name: "axfr.internal.example.com"
-      rules:
-        - match:
-            type: AAAA
-          transform:
-            type: suffix
-            suffix: "example.org"
-```
-
-AXFR requires that the authoritative server permits zone transfers from Herald's IP. In BIND:
-```
-zone "internal.example.com" {
-    allow-transfer { key axfr.internal.example.com; };  # or IP-based ACL
-};
-```
-
 ## DNS UPDATE Receiver
 
 Herald can act as a DNS UPDATE target (RFC 2136 server), accepting `nsupdate`-compatible messages over UDP and TCP. Incoming records are stored in the dynamic provider and a reconciliation pass is triggered automatically.
@@ -899,7 +828,7 @@ The Cloudflare API token must have `Zone:DNS:Edit` permission scoped to all targ
 
 ### Provider Integration
 
-Each provider (static, mirror, ACME, dynamic) specifies which zone to target for its records:
+Each provider (static, ACME, dynamic) specifies which zone to target for its records:
 
 ```yaml
 providers:
@@ -917,24 +846,6 @@ providers:
   acme:
     zone: "example.com"  # ACME challenges go to this zone
     domain: "acme.example.com"
-
-  mirror:
-    - name: "public-aaaa"
-      source: { type: dns, zone: "internal.example.com" }
-      rules:
-        - match:
-            type: AAAA
-          transform:
-            type: suffix
-            suffix: "example.com"          # Mirrors AAAA records into example.com
-    - name: "internal-a"
-      source: { type: dns, zone: "internal.example.org" }
-      rules:
-        - match:
-            type: A
-          transform:
-            type: suffix
-            suffix: "internal.example.org" # Different instance, different zone
 ```
 
 ### Reconciliation
@@ -1121,6 +1032,5 @@ Herald is designed for small to medium deployments (hundreds of DNS records). Pe
 - **Reconciliation time**: ~1-3 seconds for 100 records (dominated by Cloudflare API pagination)
 - **Memory usage**: ~10-20 MB RSS
 - **API response time**: <10ms for ACME challenge set/clear
-- **Mirror polling**: ~100-500ms for Technitium zones with 50 records
 
 Herald does not currently batch changes or parallelize API calls, so reconciliation time scales linearly with record count.
