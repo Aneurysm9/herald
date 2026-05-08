@@ -943,6 +943,55 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_duplicate_zones_reports_all() {
+        // Three backends all claim 'example.com'. The first claim wins
+        // (cloudflare[0] is the original valid_config() backend). The
+        // technitium and rfc2136 entries each produce a DuplicateZone
+        // error pointing at cloudflare[0] as the first occurrence.
+        let mut config = valid_config();
+        config.backends.technitium.push(TechnitiumConfig {
+            name: Some("tech-a".to_string()),
+            zones: vec!["example.com".to_string()],
+            url: "http://localhost:5380".to_string(),
+            token_file: "/tmp/t".to_string(),
+        });
+        config.backends.rfc2136.push(Rfc2136BackendConfig {
+            name: Some("bind-a".to_string()),
+            zones: vec!["example.com".to_string()],
+            primary_nameserver: "ns1.example.com:53".to_string(),
+            tsig_key_file: None,
+            tsig_key_name: None,
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert_eq!(
+            errors.len(),
+            2,
+            "expected 2 duplicate-zone errors (technitium and rfc2136 each \
+             collide with cloudflare[0]), got {} errors: {errors}",
+            errors.len()
+        );
+
+        let msg = errors.to_string();
+        assert!(
+            msg.contains("(2 errors)"),
+            "expected '(2 errors)' header, got: {msg}"
+        );
+        assert!(
+            msg.contains("'example.com' appears in both"),
+            "expected duplicate-zone error wording, got: {msg}"
+        );
+        assert!(
+            msg.contains("tech-a"),
+            "expected mention of technitium backend, got: {msg}"
+        );
+        assert!(
+            msg.contains("bind-a"),
+            "expected mention of rfc2136 backend, got: {msg}"
+        );
+    }
+
+    #[test]
     fn test_validate_dynamic_reports_all_unknown_zones_per_client() {
         // A single dynamic client references three zones, none of which
         // exist in any backend. Today's bail-on-first behavior would
