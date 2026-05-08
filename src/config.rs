@@ -943,6 +943,56 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_dns_server_missing_dynamic_does_not_cascade_tsig_errors() {
+        // Setup:
+        //   - dns_server has TWO TSIG keys
+        //   - providers.dynamic is absent
+        //
+        // Without the cascade guard, every TSIG key would fail with
+        // "client X not in dynamic.clients" because there are no
+        // dynamic clients to compare against. The correct behavior is
+        // exactly ONE error: DnsServerWithoutDynamic.
+        let mut config = valid_config();
+        config.providers.dynamic = None;
+        config.dns_server = Some(DnsServerConfig {
+            listen: "[::]:5353".to_string(),
+            tsig_keys: vec![
+                TsigKeyConfig {
+                    key_name: "k1.example.com".to_string(),
+                    algorithm: "hmac-sha256".to_string(),
+                    secret_file: "/tmp/s1".to_string(),
+                    client: "would-be-client-1".to_string(),
+                },
+                TsigKeyConfig {
+                    key_name: "k2.example.com".to_string(),
+                    algorithm: "hmac-sha256".to_string(),
+                    secret_file: "/tmp/s2".to_string(),
+                    client: "would-be-client-2".to_string(),
+                },
+            ],
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly 1 error (DnsServerWithoutDynamic, no per-key \
+             cascade), got {} errors: {errors}",
+            errors.len()
+        );
+
+        let msg = errors.to_string();
+        assert!(
+            msg.contains("dns_server is configured but providers.dynamic is not"),
+            "expected DnsServerWithoutDynamic message, got: {msg}"
+        );
+        assert!(
+            !msg.contains("would-be-client-1") && !msg.contains("would-be-client-2"),
+            "should NOT mention any TSIG client (no cascade), got: {msg}"
+        );
+    }
+
+    #[test]
     fn test_validate_partial_zone_set_prevents_cascade() {
         // Setup:
         //   - cloudflare[0]: empty zones (will fail with EmptyZones)
