@@ -943,6 +943,52 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_dynamic_reports_all_unknown_zones_per_client() {
+        // A single dynamic client references three zones, none of which
+        // exist in any backend. Today's bail-on-first behavior would
+        // report only one; the accumulator reports all three.
+        let mut config = valid_config();
+        config.providers.dynamic = Some(DynamicProviderConfig {
+            clients: HashMap::from([(
+                "noisy".to_string(),
+                DynamicClientConfig {
+                    allowed_domains: vec!["*.example.com".to_string()],
+                    allowed_zones: vec![
+                        "absent1.example.org".to_string(),
+                        "absent2.example.org".to_string(),
+                        "absent3.example.org".to_string(),
+                    ],
+                    rate_limit: None,
+                },
+            )]),
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert_eq!(
+            errors.len(),
+            3,
+            "expected 3 unknown-zone errors, got {}: {errors}",
+            errors.len()
+        );
+
+        let msg = errors.to_string();
+        assert!(
+            msg.contains("(3 errors)"),
+            "expected '(3 errors)' header, got: {msg}"
+        );
+        for missing in [
+            "absent1.example.org",
+            "absent2.example.org",
+            "absent3.example.org",
+        ] {
+            assert!(
+                msg.contains(missing),
+                "expected report to mention {missing}, got: {msg}"
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_dns_server_missing_dynamic_does_not_cascade_tsig_errors() {
         // Setup:
         //   - dns_server has TWO TSIG keys
