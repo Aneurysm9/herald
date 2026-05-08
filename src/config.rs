@@ -943,6 +943,58 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_partial_zone_set_prevents_cascade() {
+        // Setup:
+        //   - cloudflare[0]: empty zones (will fail with EmptyZones)
+        //   - cloudflare[1]: zones = ["example.com"] (passes)
+        //   - dynamic provider client references "example.com"
+        //
+        // Without partial-zone-set semantics, BackendsConfig would either
+        // bail on cloudflare[0] (and the dynamic check wouldn't run at all)
+        // or yield an empty zone set (and the dynamic check would phantom-
+        // fail with "zone example.com not configured"). The correct
+        // accumulator behavior is: exactly ONE error, and it is the
+        // EmptyZones error from cloudflare[0].
+        let mut config = valid_config();
+        config.backends.cloudflare[0].zones.clear(); // becomes failing backend
+        config.backends.cloudflare.push(CloudflareConfig {
+            name: Some("cf-second".to_string()),
+            zones: vec!["example.com".to_string()],
+            token_file: "/tmp/t".to_string(),
+        });
+        config.providers.dynamic = Some(DynamicProviderConfig {
+            clients: HashMap::from([(
+                "test-client".to_string(),
+                DynamicClientConfig {
+                    allowed_domains: vec!["*.example.com".to_string()],
+                    allowed_zones: vec!["example.com".to_string()],
+                    rate_limit: None,
+                },
+            )]),
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected exactly 1 error (no cascade from upstream EmptyZones), \
+             got {} errors: {errors}",
+            errors.len()
+        );
+
+        let msg = errors.to_string();
+        assert!(
+            msg.contains("no zones configured"),
+            "expected the EmptyZones error, got: {msg}"
+        );
+        assert!(
+            !msg.contains("references zone 'example.com'"),
+            "should NOT contain phantom 'zone example.com not configured' \
+             cascade error, but found it in: {msg}"
+        );
+    }
+
+    #[test]
     fn test_validate_rfc2136_reports_both_empty_zones_and_partial_tsig() {
         // A single rfc2136 backend with TWO violations — empty zones AND
         // partial tsig config. Today's pre-refactor code bailed on the first;
