@@ -358,88 +358,187 @@ fn default_reconciler_interval() -> String {
 // them, threading context (e.g., known backend zones) where cross-cutting
 // checks are needed.
 
-impl Config {
-    /// Validate the configuration for internal consistency.
-    ///
-    /// Called at startup before initializing any backends or providers.
-    /// Delegates to per-type validation methods and checks cross-cutting
-    /// constraints (e.g., provider zones must reference backend zones).
-    ///
-    /// # Errors
-    ///
-    /// Returns an error describing the first invalid configuration found.
-    pub(crate) fn validate(&self) -> Result<()> {
-        let backend_zones = self.backends.validate()?;
-        self.providers.validate(&backend_zones)?;
-        if let Some(ref dns) = self.dns_server {
-            dns.validate(&self.providers)?;
+/// One specific configuration validation failure.
+///
+/// Each variant corresponds to one rule in the validators below. The phrasing
+/// is preserved verbatim from the previous `anyhow::bail!` calls so that
+/// existing tests' substring assertions continue to pass.
+#[derive(thiserror::Error, Debug)]
+pub(crate) enum ConfigError {
+    #[error("backend {desc} has no zones configured")]
+    EmptyZones { desc: String },
+
+    #[error("backend {desc}: tsig_key_file and tsig_key_name must both be set or both omitted")]
+    Rfc2136TsigPartial { desc: String },
+
+    #[error("zone '{zone}' appears in both {first} and {second}")]
+    DuplicateZone {
+        zone: String,
+        first: String,
+        second: String,
+    },
+
+    #[error(
+        "dynamic client '{client}' references zone '{zone}' \
+         which is not configured in any backend"
+    )]
+    DynamicZoneNotConfigured { client: String, zone: String },
+
+    #[error(
+        "dns_server is configured but providers.dynamic is not — \
+         the DNS UPDATE receiver requires the dynamic provider"
+    )]
+    DnsServerWithoutDynamic,
+
+    #[error(
+        "dns_server TSIG key '{key_name}' maps to client '{client}' \
+         which is not defined in providers.dynamic.clients"
+    )]
+    TsigClientUnknown { key_name: String, client: String },
+}
+
+/// A collection of configuration validation errors, reported together at
+/// startup. Implements `std::error::Error` so it can be propagated through
+/// `?` into `anyhow::Result` at the call site in `main`.
+#[derive(Debug, Default)]
+pub(crate) struct ConfigErrors(Vec<ConfigError>);
+
+impl ConfigErrors {
+    fn push(&mut self, err: ConfigError) {
+        self.0.push(err);
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Consume this accumulator: return `Ok(())` if no errors were pushed,
+    /// otherwise `Err(self)`.
+    fn into_result(self) -> Result<(), ConfigErrors> {
+        if self.is_empty() { Ok(()) } else { Err(self) }
+    }
+}
+
+impl std::fmt::Display for ConfigErrors {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let n = self.len();
+        let plural = if n == 1 { "error" } else { "errors" };
+        writeln!(f, "configuration validation failed ({n} {plural}):")?;
+        for err in &self.0 {
+            writeln!(f, "  - {err}")?;
         }
         Ok(())
     }
 }
 
+impl std::error::Error for ConfigErrors {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        // The contained errors are independent peers, not a causation chain.
+        // Returning None avoids misrepresenting the relationship to formatters
+        // like anyhow's `{:#}` that walk the source chain.
+        None
+    }
+}
+
+impl Config {
+    /// Validate the configuration for internal consistency.
+    ///
+    /// Called at startup before initializing any backends or providers.
+    /// Accumulates every validation issue across all layers (backends,
+    /// providers, `dns_server`) into a single `ConfigErrors` report. Returns
+    /// `Ok(())` if the configuration is valid, otherwise an error describing
+    /// every issue found in one message.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ConfigErrors` listing every invalid setting. The single
+    /// caller (`main.rs`) propagates this via `?` into `anyhow::Result`,
+    /// which renders the multi-line `Display` to the operator's logs.
+    pub(crate) fn validate(&self) -> Result<(), ConfigErrors> {
+        let mut errors = ConfigErrors::default();
+        let backend_zones = self.backends.validate(&mut errors);
+        self.providers.validate(&backend_zones, &mut errors);
+        if let Some(ref dns) = self.dns_server {
+            dns.validate(&self.providers, &mut errors);
+        }
+        errors.into_result()
+    }
+}
+
 impl CloudflareConfig {
-    fn validate(&self, index: usize) -> Result<Vec<String>> {
+    fn validate(&self, index: usize, errors: &mut ConfigErrors) -> Vec<String> {
         let desc = self
             .name
             .clone()
             .unwrap_or_else(|| format!("cloudflare[{index}]"));
         if self.zones.is_empty() {
-            anyhow::bail!("backend {desc} has no zones configured");
+            errors.push(ConfigError::EmptyZones { desc });
         }
-        Ok(self.zones.clone())
+        self.zones.clone()
     }
 }
 
 impl TechnitiumConfig {
-    fn validate(&self, index: usize) -> Result<Vec<String>> {
+    fn validate(&self, index: usize, errors: &mut ConfigErrors) -> Vec<String> {
         let desc = self
             .name
             .clone()
             .unwrap_or_else(|| format!("technitium[{index}]"));
         if self.zones.is_empty() {
-            anyhow::bail!("backend {desc} has no zones configured");
+            errors.push(ConfigError::EmptyZones { desc });
         }
-        Ok(self.zones.clone())
+        self.zones.clone()
     }
 }
 
 impl Rfc2136BackendConfig {
-    fn validate(&self, index: usize) -> Result<Vec<String>> {
+    fn validate(&self, index: usize, errors: &mut ConfigErrors) -> Vec<String> {
         let desc = self
             .name
             .clone()
             .unwrap_or_else(|| format!("rfc2136[{index}]"));
         if self.zones.is_empty() {
-            anyhow::bail!("backend {desc} has no zones configured");
+            errors.push(ConfigError::EmptyZones { desc: desc.clone() });
         }
         if self.tsig_key_file.is_some() != self.tsig_key_name.is_some() {
-            anyhow::bail!(
-                "backend {desc}: tsig_key_file and tsig_key_name must both be set or both omitted"
-            );
+            errors.push(ConfigError::Rfc2136TsigPartial { desc });
         }
-        Ok(self.zones.clone())
+        self.zones.clone()
     }
 }
 
 impl BackendsConfig {
     /// Validate all backends and return the set of all configured zone names.
     ///
-    /// Checks that each backend has at least one zone and that no zone appears
-    /// in more than one backend.
-    fn validate(&self) -> Result<std::collections::HashSet<String>> {
-        let mut seen: HashMap<String, String> = HashMap::new(); // zone → backend desc
+    /// Pushes errors into `errors` for any per-backend issues (empty zones,
+    /// rfc2136 tsig partial) and any cross-backend duplicates. Always returns
+    /// the partial set of zones successfully declared so that downstream
+    /// provider validation can run against it without phantom "zone not
+    /// configured" cascades caused by an unrelated upstream failure.
+    fn validate(&self, errors: &mut ConfigErrors) -> std::collections::HashSet<String> {
+        let mut seen: HashMap<String, String> = HashMap::new(); // zone → first backend desc
+        let mut all_zones: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for (i, cf) in self.cloudflare.iter().enumerate() {
             let desc = cf
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("cloudflare[{i}]"));
-            for zone in cf.validate(i)? {
+            for zone in cf.validate(i, errors) {
                 if let Some(first) = seen.get(&zone) {
-                    anyhow::bail!("zone '{zone}' appears in both {first} and {desc}");
+                    errors.push(ConfigError::DuplicateZone {
+                        zone: zone.clone(),
+                        first: first.clone(),
+                        second: desc.clone(),
+                    });
+                } else {
+                    seen.insert(zone.clone(), desc.clone());
+                    all_zones.insert(zone);
                 }
-                seen.insert(zone, desc.clone());
             }
         }
         for (i, tech) in self.technitium.iter().enumerate() {
@@ -447,52 +546,69 @@ impl BackendsConfig {
                 .name
                 .clone()
                 .unwrap_or_else(|| format!("technitium[{i}]"));
-            for zone in tech.validate(i)? {
+            for zone in tech.validate(i, errors) {
                 if let Some(first) = seen.get(&zone) {
-                    anyhow::bail!("zone '{zone}' appears in both {first} and {desc}");
+                    errors.push(ConfigError::DuplicateZone {
+                        zone: zone.clone(),
+                        first: first.clone(),
+                        second: desc.clone(),
+                    });
+                } else {
+                    seen.insert(zone.clone(), desc.clone());
+                    all_zones.insert(zone);
                 }
-                seen.insert(zone, desc.clone());
             }
         }
         for (i, rfc) in self.rfc2136.iter().enumerate() {
             let desc = rfc.name.clone().unwrap_or_else(|| format!("rfc2136[{i}]"));
-            for zone in rfc.validate(i)? {
+            for zone in rfc.validate(i, errors) {
                 if let Some(first) = seen.get(&zone) {
-                    anyhow::bail!("zone '{zone}' appears in both {first} and {desc}");
+                    errors.push(ConfigError::DuplicateZone {
+                        zone: zone.clone(),
+                        first: first.clone(),
+                        second: desc.clone(),
+                    });
+                } else {
+                    seen.insert(zone.clone(), desc.clone());
+                    all_zones.insert(zone);
                 }
-                seen.insert(zone, desc.clone());
             }
         }
 
-        Ok(seen.into_keys().collect())
+        all_zones
     }
 }
 
 impl DynamicProviderConfig {
     /// Validate that all client `allowed_zones` reference zones in some backend.
-    fn validate(&self, backend_zones: &std::collections::HashSet<String>) -> Result<()> {
+    fn validate(
+        &self,
+        backend_zones: &std::collections::HashSet<String>,
+        errors: &mut ConfigErrors,
+    ) {
         for (client_name, client_config) in &self.clients {
             for zone in &client_config.allowed_zones {
                 if !backend_zones.contains(zone) {
-                    anyhow::bail!(
-                        "dynamic client '{client_name}' references zone '{zone}' \
-                         which is not configured in any backend"
-                    );
+                    errors.push(ConfigError::DynamicZoneNotConfigured {
+                        client: client_name.clone(),
+                        zone: zone.clone(),
+                    });
                 }
             }
         }
-        Ok(())
     }
 }
 
 impl ProvidersConfig {
     /// Validate providers against the set of known backend zones.
-    fn validate(&self, backend_zones: &std::collections::HashSet<String>) -> Result<()> {
+    fn validate(
+        &self,
+        backend_zones: &std::collections::HashSet<String>,
+        errors: &mut ConfigErrors,
+    ) {
         if let Some(ref dynamic) = self.dynamic {
-            dynamic.validate(backend_zones)?;
+            dynamic.validate(backend_zones, errors);
         }
-
-        Ok(())
     }
 }
 
@@ -501,25 +617,23 @@ impl DnsServerConfig {
     ///
     /// Requires the dynamic provider to be configured, and all TSIG key
     /// `client` fields must reference existing dynamic provider clients.
-    fn validate(&self, providers: &ProvidersConfig) -> Result<()> {
+    /// If `providers.dynamic` is not configured, the per-key check is
+    /// skipped to avoid cascading "client not in dynamic.clients" errors
+    /// that would otherwise be reported once per configured TSIG key.
+    fn validate(&self, providers: &ProvidersConfig, errors: &mut ConfigErrors) {
         let Some(ref dynamic) = providers.dynamic else {
-            anyhow::bail!(
-                "dns_server is configured but providers.dynamic is not — \
-                 the DNS UPDATE receiver requires the dynamic provider"
-            );
+            errors.push(ConfigError::DnsServerWithoutDynamic);
+            return;
         };
 
         for key in &self.tsig_keys {
             if !dynamic.clients.contains_key(&key.client) {
-                anyhow::bail!(
-                    "dns_server TSIG key '{}' maps to client '{}' \
-                     which is not defined in providers.dynamic.clients",
-                    key.key_name,
-                    key.client
-                );
+                errors.push(ConfigError::TsigClientUnknown {
+                    key_name: key.key_name.clone(),
+                    client: key.client.clone(),
+                });
             }
         }
-        Ok(())
     }
 }
 
@@ -826,5 +940,145 @@ mod tests {
             err.contains("tsig_key_file") && err.contains("tsig_key_name"),
             "expected both tsig fields mentioned, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_validate_accumulates_multiple_errors() {
+        // Two distinct violations: cloudflare[0] has empty zones AND a duplicate
+        // zone 'example.com' is declared by cloudflare[1] and a technitium backend.
+        let mut config = valid_config();
+        config.backends.cloudflare[0].zones.clear(); // first violation
+        config.backends.cloudflare.push(CloudflareConfig {
+            name: Some("cf-second".to_string()),
+            zones: vec!["example.com".to_string()],
+            token_file: "/tmp/t".to_string(),
+        });
+        config.backends.technitium.push(TechnitiumConfig {
+            name: Some("tech-dup".to_string()),
+            zones: vec!["example.com".to_string()], // duplicates cf-second
+            url: "http://localhost:5380".to_string(),
+            token_file: "/tmp/t".to_string(),
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert_eq!(
+            errors.len(),
+            2,
+            "expected 2 accumulated errors, got {}: {errors}",
+            errors.len()
+        );
+
+        let msg = errors.to_string();
+        assert!(
+            msg.contains("(2 errors)"),
+            "expected '(2 errors)' header, got: {msg}"
+        );
+        assert!(
+            msg.contains("cf-test") || msg.contains("cloudflare[0]"),
+            "expected mention of empty-zones backend, got: {msg}"
+        );
+        assert!(
+            msg.contains("'example.com' appears in both"),
+            "expected duplicate-zone message, got: {msg}"
+        );
+    }
+
+    // ── ConfigErrors Display tests ───────────────────────────────────────────
+
+    #[test]
+    fn test_config_errors_display_singular() {
+        let mut errors = ConfigErrors::default();
+        errors.push(ConfigError::EmptyZones {
+            desc: "cloudflare[0]".to_string(),
+        });
+        let s = errors.to_string();
+        assert!(
+            s.contains("(1 error)"),
+            "expected singular header '(1 error)', got: {s}"
+        );
+        assert!(
+            s.contains("backend cloudflare[0] has no zones configured"),
+            "expected error body, got: {s}"
+        );
+        assert!(
+            s.starts_with("configuration validation failed"),
+            "expected header line, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_config_errors_display_plural_with_indented_bullets() {
+        let mut errors = ConfigErrors::default();
+        errors.push(ConfigError::EmptyZones {
+            desc: "cloudflare[0]".to_string(),
+        });
+        errors.push(ConfigError::DuplicateZone {
+            zone: "example.com".to_string(),
+            first: "cf-a".to_string(),
+            second: "cf-b".to_string(),
+        });
+        let s = errors.to_string();
+        assert!(
+            s.contains("(2 errors)"),
+            "expected plural header '(2 errors)', got: {s}"
+        );
+        assert!(
+            s.contains("\n  - backend cloudflare[0] has no zones configured"),
+            "expected indented bullet for first error, got: {s}"
+        );
+        assert!(
+            s.contains("\n  - zone 'example.com' appears in both cf-a and cf-b"),
+            "expected indented bullet for second error, got: {s}"
+        );
+    }
+
+    #[test]
+    fn test_config_errors_into_result_empty_is_ok() {
+        let errors = ConfigErrors::default();
+        assert!(errors.into_result().is_ok());
+    }
+
+    #[test]
+    fn test_config_errors_into_result_nonempty_is_err() {
+        let mut errors = ConfigErrors::default();
+        errors.push(ConfigError::DnsServerWithoutDynamic);
+        let result = errors.into_result();
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().len(), 1);
+    }
+
+    #[test]
+    fn test_config_error_all_variants_render() {
+        // Smoke test: every variant must have a non-empty Display rendering.
+        // Also serves to construct each variant at least once so subsequent
+        // tasks adding pushers don't change the dead_code surface.
+        let cases: Vec<ConfigError> = vec![
+            ConfigError::EmptyZones {
+                desc: "cloudflare[0]".to_string(),
+            },
+            ConfigError::Rfc2136TsigPartial {
+                desc: "rfc2136[0]".to_string(),
+            },
+            ConfigError::DuplicateZone {
+                zone: "example.com".to_string(),
+                first: "a".to_string(),
+                second: "b".to_string(),
+            },
+            ConfigError::DynamicZoneNotConfigured {
+                client: "client".to_string(),
+                zone: "example.com".to_string(),
+            },
+            ConfigError::DnsServerWithoutDynamic,
+            ConfigError::TsigClientUnknown {
+                key_name: "k".to_string(),
+                client: "c".to_string(),
+            },
+        ];
+        for case in cases {
+            assert!(
+                !case.to_string().is_empty(),
+                "variant {case:?} rendered empty"
+            );
+        }
     }
 }
