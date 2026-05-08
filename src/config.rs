@@ -943,6 +943,43 @@ mod tests {
     }
 
     #[test]
+    fn test_validate_rfc2136_reports_both_empty_zones_and_partial_tsig() {
+        // A single rfc2136 backend with TWO violations — empty zones AND
+        // partial tsig config. Today's pre-refactor code bailed on the first;
+        // the accumulator must report both.
+        let mut config = valid_config();
+        config.backends.cloudflare.clear();
+        config.backends.rfc2136.push(Rfc2136BackendConfig {
+            name: Some("bind".to_string()),
+            zones: vec![], // first violation: empty zones
+            primary_nameserver: "ns1.example.com:53".to_string(),
+            tsig_key_file: Some("/tmp/key".to_string()),
+            tsig_key_name: None, // second violation: tsig partial
+        });
+
+        let errors = config.validate().unwrap_err();
+        assert_eq!(
+            errors.len(),
+            2,
+            "expected 2 errors from one rfc2136 backend with two issues, got: {errors}",
+        );
+
+        let msg = errors.to_string();
+        assert!(
+            msg.contains("(2 errors)"),
+            "expected '(2 errors)' header, got: {msg}"
+        );
+        assert!(
+            msg.contains("backend bind has no zones configured"),
+            "expected empty-zones bullet, got: {msg}"
+        );
+        assert!(
+            msg.contains("tsig_key_file") && msg.contains("tsig_key_name"),
+            "expected tsig partial bullet mentioning both fields, got: {msg}"
+        );
+    }
+
+    #[test]
     fn test_validate_accumulates_multiple_errors() {
         // Two distinct violations: cloudflare[0] has empty zones AND a duplicate
         // zone 'example.com' is declared by cloudflare[1] and a technitium backend.
