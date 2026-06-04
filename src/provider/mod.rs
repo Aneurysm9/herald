@@ -86,8 +86,7 @@ impl fmt::Display for EnrichedRecord {
 }
 
 /// Classification of a provider issue, used to route future retry/alerting.
-// The Provider trait migration tasks (following this one) wire these types into
-// callers; allow dead_code until then so clippy stays green mid-refactor.
+// Variants are used in tests and will be matched in the delete-guard (Task 4).
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IssueKind {
@@ -102,17 +101,17 @@ pub(crate) enum IssueKind {
 /// Issues are surfaced as warnings (API) and logged/counted (reconciler).
 /// Their presence marks a provider's report as incomplete, which suppresses
 /// deletions for that reconciliation cycle.
-// See IssueKind allow comment above.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderIssue {
+    // `kind` is matched in tests and will be used for routing in Task 4.
+    #[allow(dead_code)]
     pub kind: IssueKind,
     pub message: String,
 }
 
 impl ProviderIssue {
     /// A transient (likely recoverable) issue.
-    // See IssueKind allow comment above.
+    // Constructors are used in tests; Task 3 will call them in production code.
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn transient(message: impl Into<String>) -> Self {
@@ -123,7 +122,6 @@ impl ProviderIssue {
     }
 
     /// A permanent issue requiring operator attention.
-    // See IssueKind allow comment above.
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn permanent(message: impl Into<String>) -> Self {
@@ -139,8 +137,6 @@ impl ProviderIssue {
 /// A report with no issues means the provider reported its *full* desired
 /// state. A report with issues is "incomplete": the reconciler must not treat
 /// records absent from it as deletion intent.
-// See IssueKind allow comment above.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ProviderReport {
     pub records: Vec<DesiredRecord>,
@@ -149,9 +145,7 @@ pub(crate) struct ProviderReport {
 
 impl ProviderReport {
     /// A complete report with no issues.
-    // See IssueKind allow comment above.
     #[must_use]
-    #[allow(dead_code)]
     pub(crate) fn ok(records: Vec<DesiredRecord>) -> Self {
         Self {
             records,
@@ -160,7 +154,7 @@ impl ProviderReport {
     }
 
     /// True when the provider reported its full desired state (no issues).
-    // See IssueKind allow comment above.
+    // Used in tests; Task 4 (delete-guard) will call this in production code.
     #[must_use]
     #[allow(dead_code)]
     pub(crate) fn is_complete(&self) -> bool {
@@ -180,7 +174,7 @@ pub(crate) trait Named {
 /// Providers are independent and composable.
 pub(crate) trait Provider: Named + Send + Sync {
     /// Returns the current set of desired DNS records from this provider.
-    fn records(&self) -> Pin<Box<dyn Future<Output = Result<Vec<DesiredRecord>>> + Send + '_>>;
+    fn records(&self) -> Pin<Box<dyn Future<Output = Result<ProviderReport>> + Send + '_>>;
 }
 
 /// Check that a client is allowed to manage records for the given FQDN.
@@ -219,7 +213,7 @@ impl<T: Named> Named for Arc<T> {
 /// This is needed because `AcmeProvider` is shared between background tasks
 /// and the provider list.
 impl<T: Provider> Provider for Arc<T> {
-    fn records(&self) -> Pin<Box<dyn Future<Output = Result<Vec<DesiredRecord>>> + Send + '_>> {
+    fn records(&self) -> Pin<Box<dyn Future<Output = Result<ProviderReport>> + Send + '_>> {
         T::records(self)
     }
 }

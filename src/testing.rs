@@ -516,7 +516,7 @@ impl Backend for FakeBackend {
             let Some(ref provider) = self.provider else {
                 return Ok(Vec::new());
             };
-            let desired = provider.records().await?;
+            let desired = provider.records().await?.records;
             let zone = self.zones.first().cloned().unwrap_or_default();
             Ok(desired
                 .into_iter()
@@ -702,6 +702,7 @@ impl DnsServerFixture {
             .records()
             .await
             .expect("records() should not fail in tests")
+            .records
             .into_iter()
             .map(|r| {
                 (

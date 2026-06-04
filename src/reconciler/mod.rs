@@ -113,17 +113,27 @@ impl Reconciler {
         let mut desired = Vec::new();
         for provider in providers {
             match provider.records().await {
-                Ok(records) => {
+                Ok(report) => {
                     tracing::debug!(
                         provider = provider.name(),
-                        count = records.len(),
+                        count = report.records.len(),
                         "collected records"
                     );
                     self.metrics.provider_records.record(
-                        records.len() as u64,
+                        report.records.len() as u64,
                         &[KeyValue::new("provider", provider.name().to_string())],
                     );
-                    desired.extend(records);
+                    for issue in &report.issues {
+                        tracing::warn!(
+                            provider = provider.name(),
+                            issue = %issue.message,
+                            "provider reported an issue"
+                        );
+                        self.metrics
+                            .provider_errors
+                            .add(1, &[KeyValue::new("provider", provider.name().to_string())]);
+                    }
+                    desired.extend(report.records);
                 }
                 Err(e) => {
                     tracing::error!(provider = provider.name(), error = %e, "failed to collect records");
@@ -389,7 +399,7 @@ mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
     use crate::backend::ExistingRecord;
-    use crate::provider::{Named, RecordValue};
+    use crate::provider::{Named, ProviderReport, RecordValue};
     use crate::telemetry::Metrics;
     use std::future::Future;
     use std::pin::Pin;
@@ -441,14 +451,14 @@ mod tests {
     }
 
     impl Provider for StubProvider {
-        fn records(&self) -> Pin<Box<dyn Future<Output = Result<Vec<DesiredRecord>>> + Send + '_>> {
+        fn records(&self) -> Pin<Box<dyn Future<Output = Result<ProviderReport>> + Send + '_>> {
             let fail = self.fail;
             let desired = self.desired.clone();
             Box::pin(async move {
                 if fail {
                     anyhow::bail!("stub provider error");
                 }
-                Ok(desired)
+                Ok(ProviderReport::ok(desired))
             })
         }
     }

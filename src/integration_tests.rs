@@ -170,7 +170,7 @@ async fn test_acme_challenge_lifecycle() {
         .unwrap();
 
     // Verify the provider now emits no records
-    let records = acme.records().await.unwrap();
+    let records = acme.records().await.unwrap().records;
     assert!(records.is_empty(), "expected no records after clear");
 }
 
@@ -232,7 +232,7 @@ async fn test_dynamic_dns_lifecycle() {
         .unwrap();
 
     // Verify provider emits no records
-    let records = dynamic.records().await.unwrap();
+    let records = dynamic.records().await.unwrap().records;
     assert!(records.is_empty());
 }
 

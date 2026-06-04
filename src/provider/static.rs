@@ -1,7 +1,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
-use super::{DesiredRecord, Named, Provider, RecordValue};
+use super::{DesiredRecord, Named, Provider, ProviderReport, RecordValue};
 use crate::config::StaticProviderConfig;
 use anyhow::Result;
 
@@ -51,9 +51,9 @@ impl Named for StaticProvider {
 }
 
 impl Provider for StaticProvider {
-    fn records(&self) -> Pin<Box<dyn Future<Output = Result<Vec<DesiredRecord>>> + Send + '_>> {
+    fn records(&self) -> Pin<Box<dyn Future<Output = Result<ProviderReport>> + Send + '_>> {
         let records = self.records.clone();
-        Box::pin(async move { Ok(records) })
+        Box::pin(async move { Ok(ProviderReport::ok(records)) })
     }
 }
 
@@ -187,7 +187,7 @@ mod tests {
                 make_record("b.example.com", "A", "2.2.2.2"),
             ],
         });
-        let records = Provider::records(&provider).await.unwrap();
+        let records = Provider::records(&provider).await.unwrap().records;
         assert_eq!(records.len(), 2);
     }
 }

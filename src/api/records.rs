@@ -39,9 +39,9 @@ pub(super) async fn get_records(
 
     for provider in &state.providers {
         match provider.records().await {
-            Ok(records) => {
+            Ok(report) => {
                 let provider_name = provider.name().to_string();
-                all_records.extend(records.into_iter().map(|record| ProviderRecord {
+                all_records.extend(report.records.into_iter().map(|record| ProviderRecord {
                     provider: provider_name.clone(),
                     record,
                 }));

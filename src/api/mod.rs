@@ -143,7 +143,7 @@ pub(crate) mod tests {
     use super::*;
     use crate::backend::{Change, ExistingRecord};
     use crate::config::{AcmeClientConfig, AcmeProviderConfig};
-    use crate::provider::{DesiredRecord, Named};
+    use crate::provider::{DesiredRecord, Named, ProviderReport};
     use crate::telemetry::Metrics;
     use axum_test::TestServer;
     use std::future::Future;
@@ -164,14 +164,14 @@ pub(crate) mod tests {
     impl Provider for StubProvider {
         fn records(
             &self,
-        ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<DesiredRecord>>> + Send + '_>> {
+        ) -> Pin<Box<dyn Future<Output = anyhow::Result<ProviderReport>> + Send + '_>> {
             let fail = self.fail;
             let desired = self.desired.clone();
             Box::pin(async move {
                 if fail {
                     anyhow::bail!("stub provider error");
                 }
-                Ok(desired)
+                Ok(ProviderReport::ok(desired))
             })
         }
     }

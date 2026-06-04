@@ -1,4 +1,4 @@
-use super::{DesiredRecord, Named, Provider, RecordValue, check_domain_permission};
+use super::{DesiredRecord, Named, Provider, ProviderReport, RecordValue, check_domain_permission};
 use crate::config::DynamicProviderConfig;
 use crate::storage::SqliteStorage;
 use crate::telemetry::Metrics;
@@ -361,7 +361,7 @@ impl Named for DynamicProvider {
 }
 
 impl Provider for DynamicProvider {
-    fn records(&self) -> Pin<Box<dyn Future<Output = Result<Vec<DesiredRecord>>> + Send + '_>> {
+    fn records(&self) -> Pin<Box<dyn Future<Output = Result<ProviderReport>> + Send + '_>> {
         Box::pin(async move {
             let records = self.records.read().await;
             let result = records
@@ -385,7 +385,7 @@ impl Provider for DynamicProvider {
                     }
                 })
                 .collect();
-            Ok(result)
+            Ok(ProviderReport::ok(result))
         })
     }
 }
@@ -515,7 +515,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let records = provider.records().await.unwrap();
+        let records = provider.records().await.unwrap().records;
         assert!(records.is_empty());
     }
 
@@ -590,7 +590,7 @@ mod tests {
             .await
             .unwrap();
 
-        let records = provider.records().await.unwrap();
+        let records = provider.records().await.unwrap().records;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "wan.example.com");
         assert_eq!(
@@ -627,7 +627,7 @@ mod tests {
             .await
             .unwrap();
 
-        let records = provider.records().await.unwrap();
+        let records = provider.records().await.unwrap().records;
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].value,
