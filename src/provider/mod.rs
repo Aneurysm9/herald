@@ -85,6 +85,89 @@ impl fmt::Display for EnrichedRecord {
     }
 }
 
+/// Classification of a provider issue, used to route future retry/alerting.
+// The Provider trait migration tasks (following this one) wire these types into
+// callers; allow dead_code until then so clippy stays green mid-refactor.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IssueKind {
+    /// Likely recoverable on a later cycle (e.g., network timeout).
+    Transient,
+    /// Requires operator attention (e.g., invalid stored record, bad config).
+    Permanent,
+}
+
+/// A non-fatal problem a provider hit while producing records.
+///
+/// Issues are surfaced as warnings (API) and logged/counted (reconciler).
+/// Their presence marks a provider's report as incomplete, which suppresses
+/// deletions for that reconciliation cycle.
+// See IssueKind allow comment above.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderIssue {
+    pub kind: IssueKind,
+    pub message: String,
+}
+
+impl ProviderIssue {
+    /// A transient (likely recoverable) issue.
+    // See IssueKind allow comment above.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn transient(message: impl Into<String>) -> Self {
+        Self {
+            kind: IssueKind::Transient,
+            message: message.into(),
+        }
+    }
+
+    /// A permanent issue requiring operator attention.
+    // See IssueKind allow comment above.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            kind: IssueKind::Permanent,
+            message: message.into(),
+        }
+    }
+}
+
+/// A provider's contribution to desired state, plus any issues it hit.
+///
+/// A report with no issues means the provider reported its *full* desired
+/// state. A report with issues is "incomplete": the reconciler must not treat
+/// records absent from it as deletion intent.
+// See IssueKind allow comment above.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProviderReport {
+    pub records: Vec<DesiredRecord>,
+    pub issues: Vec<ProviderIssue>,
+}
+
+impl ProviderReport {
+    /// A complete report with no issues.
+    // See IssueKind allow comment above.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn ok(records: Vec<DesiredRecord>) -> Self {
+        Self {
+            records,
+            issues: Vec::new(),
+        }
+    }
+
+    /// True when the provider reported its full desired state (no issues).
+    // See IssueKind allow comment above.
+    #[must_use]
+    #[allow(dead_code)]
+    pub(crate) fn is_complete(&self) -> bool {
+        self.issues.is_empty()
+    }
+}
+
 /// Shared sub-trait for named components (providers and backends).
 pub(crate) trait Named {
     /// Returns the name of this component (for logging and diagnostics).
@@ -138,5 +221,33 @@ impl<T: Named> Named for Arc<T> {
 impl<T: Provider> Provider for Arc<T> {
     fn records(&self) -> Pin<Box<dyn Future<Output = Result<Vec<DesiredRecord>>> + Send + '_>> {
         T::records(self)
+    }
+}
+
+#[cfg(test)]
+mod report_tests {
+    use super::*;
+
+    #[test]
+    fn ok_report_is_complete() {
+        let report = ProviderReport::ok(vec![]);
+        assert!(report.is_complete());
+    }
+
+    #[test]
+    fn report_with_issue_is_incomplete() {
+        let report = ProviderReport {
+            records: vec![],
+            issues: vec![ProviderIssue::permanent("bad record")],
+        };
+        assert!(!report.is_complete());
+        assert_eq!(report.issues[0].kind, IssueKind::Permanent);
+        assert_eq!(report.issues[0].message, "bad record");
+    }
+
+    #[test]
+    fn transient_constructor_sets_kind() {
+        let issue = ProviderIssue::transient("network blip");
+        assert_eq!(issue.kind, IssueKind::Transient);
     }
 }
