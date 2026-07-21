@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.5.0] — 2026-07-21
+
+### Features
+
+- Expire challenges after configurable TTL (#38)([d777b22](https://github.com/Aneurysm9/herald/commit/d777b22365edb25d12ef427a35fbd4d48f917b19))
+
+- Provider error model with partial reports and reconciler delete-guard (#32)([fcfc425](https://github.com/Aneurysm9/herald/commit/fcfc425038dafd65d3acd8333c1bba7f591cf2b2))
+
+
+### Refactoring
+
+- Accumulate validation errors instead of bailing on first([b4b8a4c](https://github.com/Aneurysm9/herald/commit/b4b8a4cc0d6145ef432f8a1dd441745686752538))
+
 ## [0.4.0] — 2026-05-07
 
 ### Features
