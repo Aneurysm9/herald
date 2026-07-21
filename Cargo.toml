@@ -57,7 +57,7 @@ thiserror = "2"
 hmac = "0.13"
 sha2 = "0.11"
 hex = "0.4"
-rand = "0.9"
+rand = "0.10"
 base64 = "0.22"
 
 # Async stream combinators (used for AXFR zone transfer streaming)
