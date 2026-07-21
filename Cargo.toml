@@ -73,9 +73,9 @@ clap = { version = "4", features = ["derive"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 # OpenTelemetry
-opentelemetry = "0.31"
-opentelemetry_sdk = { version = "0.31", features = ["metrics", "rt-tokio"] }
-opentelemetry-otlp = { version = "0.31", features = ["metrics", "http-proto"] }
+opentelemetry = "0.32"
+opentelemetry_sdk = { version = "0.32", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.32", features = ["metrics", "http-proto"] }
 governor = "0.10.4"
 dashmap = "6.1.0"
 
