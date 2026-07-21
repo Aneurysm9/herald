@@ -114,7 +114,7 @@ mod tests {
             rate_limiter: None,
         });
 
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let response = server
             .get("/api/v1/records")
@@ -179,7 +179,7 @@ mod tests {
             rate_limiter: None,
         });
 
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let response = server
             .get("/api/v1/records")
@@ -252,7 +252,7 @@ mod tests {
             rate_limiter: None,
         });
 
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let response = server
             .get("/api/v1/records")

@@ -58,7 +58,7 @@ mod tests {
             rate_limiter: None,
         });
 
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let response = server
             .post("/api/v1/reconcile")

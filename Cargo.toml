@@ -80,7 +80,7 @@ governor = "0.10.4"
 dashmap = "6.1.0"
 
 [dev-dependencies]
-axum-test = "17"
+axum-test = "20"
 wiremock = "0.6"
 
 [lints.clippy]

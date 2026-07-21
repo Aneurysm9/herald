@@ -126,7 +126,7 @@ mod tests {
     fn test_acme_server() -> TestServer {
         let state = test_state();
         let app = router(state);
-        TestServer::new(app.into_make_service()).unwrap()
+        TestServer::new(app.into_make_service())
     }
 
     #[tokio::test]
@@ -270,7 +270,7 @@ mod tests {
             rate_limiter: None,
         });
 
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         // Test set_challenge without ACME configured
         let response = server
