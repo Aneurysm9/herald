@@ -187,6 +187,9 @@ providers:
 
   # ACME DNS-01 challenge proxy
   acme:
+    # Challenges older than this are expired and cleaned up (default 48h).
+    # Guards against clients that crash mid-renewal and never clear.
+    challenge_ttl: "48h"
     clients:
       proxy:
         allowed_domains:

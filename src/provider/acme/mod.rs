@@ -22,6 +22,9 @@ pub(crate) struct AcmeProvider {
     challenges: Arc<RwLock<HashMap<String, ChallengeEntry>>>,
     storage: Option<Arc<Mutex<SqliteStorage<String, ChallengeEntry>>>>,
     metrics: Metrics,
+    /// Parsed from `config.challenge_ttl`; challenges older than this are
+    /// expired out of the desired state.
+    challenge_ttl: std::time::Duration,
 }
 
 /// An active ACME challenge entry.
@@ -34,6 +37,18 @@ pub(crate) struct ChallengeEntry {
     pub(crate) value: String,
     /// Which client set this challenge (for ownership verification on clear)
     pub(crate) client: String,
+    /// Unix timestamp (seconds) when the challenge was set. Entries persisted
+    /// before this field existed deserialize as "now", starting their TTL
+    /// clock at upgrade rather than expiring immediately.
+    #[serde(default = "unix_now")]
+    pub(crate) created_at: u64,
+}
+
+/// Current Unix time in whole seconds.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 impl AcmeProvider {
@@ -75,11 +90,15 @@ impl AcmeProvider {
             (HashMap::new(), None)
         };
 
+        let challenge_ttl = humantime::parse_duration(&config.challenge_ttl)
+            .with_context(|| format!("invalid challenge_ttl: {}", config.challenge_ttl))?;
+
         Ok(Self {
             config,
             challenges: Arc::new(RwLock::new(challenges_map)),
             storage,
             metrics,
+            challenge_ttl,
         })
     }
 
@@ -118,6 +137,7 @@ impl AcmeProvider {
         let entry = ChallengeEntry {
             value: value.to_string(),
             client: client.to_string(),
+            created_at: unix_now(),
         };
 
         // Persist to database first — the durable store is the source of truth.
@@ -225,6 +245,63 @@ impl AcmeProvider {
         super::check_domain_permission(client, fqdn, &client_config.allowed_domains)
     }
 
+    /// True when a challenge is older than the configured `challenge_ttl`.
+    fn is_expired(&self, entry: &ChallengeEntry, now: u64) -> bool {
+        now.saturating_sub(entry.created_at) > self.challenge_ttl.as_secs()
+    }
+
+    /// Remove expired challenges from storage and memory.
+    ///
+    /// Storage deletion happens first, mirroring `clear_challenge` ordering;
+    /// if it fails the entry is left in place and retried next cycle —
+    /// `records()` excludes it from the desired state either way. Entries are
+    /// re-checked under the write lock so a challenge refreshed by a
+    /// concurrent `set_challenge` is not removed.
+    async fn purge_expired(&self, expired: Vec<String>, now: u64) {
+        for fqdn in expired {
+            if let Some(ref storage) = self.storage {
+                let storage = Arc::clone(storage);
+                let key = fqdn.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    let storage = storage.blocking_lock();
+                    storage.delete(&key)
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!(
+                            fqdn = %fqdn,
+                            error = %e,
+                            "failed to purge expired ACME challenge from storage; will retry"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        tracing::warn!(fqdn = %fqdn, error = %e, "storage purge task panicked");
+                        continue;
+                    }
+                }
+            }
+
+            let mut challenges = self.challenges.write().await;
+            if let Some(entry) = challenges.get(&fqdn)
+                && self.is_expired(entry, now)
+            {
+                let entry = challenges.remove(&fqdn);
+                drop(challenges);
+                tracing::warn!(
+                    fqdn = %fqdn,
+                    client = entry.map(|e| e.client).as_deref().unwrap_or("unknown"),
+                    ttl = %self.config.challenge_ttl,
+                    "ACME challenge expired without being cleared"
+                );
+                self.metrics.acme_challenges_active.add(-1, &[]);
+                self.metrics.acme_challenges_expired.add(1, &[]);
+            }
+        }
+    }
+
     /// Get a handle to the challenges map for direct access.
     ///
     /// Provides read/write access to the internal challenge store.
@@ -245,9 +322,29 @@ impl Named for AcmeProvider {
 impl Provider for AcmeProvider {
     fn records(&self) -> Pin<Box<dyn Future<Output = Result<ProviderReport>> + Send + '_>> {
         Box::pin(async move {
+            let now = unix_now();
+
+            // Purge expired challenges (crashed clients that never cleared).
+            // Expiry is intentional removal from desired state — NOT a
+            // ProviderIssue. An issue would mark this report incomplete and
+            // trip the reconciler's delete-guard, blocking cleanup of the
+            // orphaned TXT record at the backend forever.
+            let expired: Vec<String> = {
+                let challenges = self.challenges.read().await;
+                challenges
+                    .iter()
+                    .filter(|(_, entry)| self.is_expired(entry, now))
+                    .map(|(fqdn, _)| fqdn.clone())
+                    .collect()
+            };
+            if !expired.is_empty() {
+                self.purge_expired(expired, now).await;
+            }
+
             let challenges = self.challenges.read().await;
             let records = challenges
                 .iter()
+                .filter(|(_, entry)| !self.is_expired(entry, now))
                 .map(|(fqdn, challenge)| DesiredRecord {
                     name: fqdn.clone(),
                     value: RecordValue::TXT(challenge.value.clone()),
@@ -281,7 +378,15 @@ mod tests {
                 allowed_domains: vec!["beta.example.com".to_string()],
             },
         );
-        AcmeProvider::new(AcmeProviderConfig { clients }, None, Metrics::noop()).unwrap()
+        AcmeProvider::new(
+            AcmeProviderConfig {
+                clients,
+                challenge_ttl: "48h".to_string(),
+            },
+            None,
+            Metrics::noop(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -351,8 +456,15 @@ mod tests {
                 allowed_domains: vec!["shared.example.com".to_string()],
             },
         );
-        let provider =
-            AcmeProvider::new(AcmeProviderConfig { clients }, None, Metrics::noop()).unwrap();
+        let provider = AcmeProvider::new(
+            AcmeProviderConfig {
+                clients,
+                challenge_ttl: "48h".to_string(),
+            },
+            None,
+            Metrics::noop(),
+        )
+        .unwrap();
 
         provider
             .set_challenge("client_a", "_acme-challenge.shared.example.com", "token123")
@@ -399,6 +511,141 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn expired_challenge_is_dropped_and_report_stays_complete() {
+        let mut clients = HashMap::new();
+        clients.insert(
+            "client_a".to_string(),
+            AcmeClientConfig {
+                rate_limit: None,
+                allowed_domains: vec!["*.example.com".to_string()],
+            },
+        );
+        let config = AcmeProviderConfig {
+            clients,
+            challenge_ttl: "1h".to_string(),
+        };
+        let provider = AcmeProvider::new(config, None, Metrics::noop()).unwrap();
+
+        // A fresh challenge set through the public API.
+        provider
+            .set_challenge(
+                "client_a",
+                "_acme-challenge.fresh.example.com",
+                "fresh-token",
+            )
+            .await
+            .unwrap();
+
+        // An aged challenge inserted directly, created 2h ago (TTL is 1h).
+        let two_hours_ago = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            - 7200;
+        provider.challenge_store().write().await.insert(
+            "_acme-challenge.stale.example.com".to_string(),
+            ChallengeEntry {
+                value: "stale-token".to_string(),
+                client: "client_a".to_string(),
+                created_at: two_hours_ago,
+            },
+        );
+
+        let report = provider.records().await.unwrap();
+
+        // The fresh challenge is still served; the expired one is gone.
+        let names: Vec<&str> = report.records.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["_acme-challenge.fresh.example.com"]);
+
+        // Expiry is intentional removal from desired state, NOT a provider
+        // issue. An issue here would trip the reconciler's delete-guard and
+        // permanently block cleanup of the orphaned TXT record at the backend.
+        assert!(report.is_complete());
+        assert!(report.issues.is_empty());
+    }
+
+    #[tokio::test]
+    async fn expired_challenge_is_purged_from_memory_and_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("acme.db");
+
+        // Seed the database with an already-expired challenge, simulating an
+        // orphan left behind by a crashed ACME client before a restart.
+        {
+            let storage: SqliteStorage<String, ChallengeEntry> =
+                SqliteStorage::new(&db_path, "acme_challenges").unwrap();
+            storage
+                .upsert(
+                    &"_acme-challenge.stale.example.com".to_string(),
+                    &ChallengeEntry {
+                        value: "stale-token".to_string(),
+                        client: "client_a".to_string(),
+                        created_at: unix_now() - 7200,
+                    },
+                )
+                .unwrap();
+        }
+
+        let mut clients = HashMap::new();
+        clients.insert(
+            "client_a".to_string(),
+            AcmeClientConfig {
+                rate_limit: None,
+                allowed_domains: vec!["*.example.com".to_string()],
+            },
+        );
+        let config = AcmeProviderConfig {
+            clients: clients.clone(),
+            challenge_ttl: "1h".to_string(),
+        };
+        let provider = AcmeProvider::new(config, Some(db_path.clone()), Metrics::noop()).unwrap();
+
+        // The expired challenge is not served...
+        let report = provider.records().await.unwrap();
+        assert!(report.records.is_empty());
+        assert!(report.is_complete());
+
+        // ...and has been purged from the in-memory map...
+        assert!(provider.challenge_store().read().await.is_empty());
+
+        // ...and from SQLite: a fresh provider loading the same database
+        // starts with no challenges.
+        drop(provider);
+        let config = AcmeProviderConfig {
+            clients,
+            challenge_ttl: "1h".to_string(),
+        };
+        let reloaded = AcmeProvider::new(config, Some(db_path), Metrics::noop()).unwrap();
+        assert!(reloaded.challenge_store().read().await.is_empty());
+    }
+
+    #[test]
+    fn invalid_challenge_ttl_is_rejected_at_construction() {
+        let config = AcmeProviderConfig {
+            clients: HashMap::new(),
+            challenge_ttl: "not-a-duration".to_string(),
+        };
+        let Err(err) = AcmeProvider::new(config, None, Metrics::noop()) else {
+            panic!("constructing a provider with a bad TTL should fail");
+        };
+        assert!(err.to_string().contains("invalid challenge_ttl"));
+    }
+
+    #[test]
+    fn legacy_entry_without_created_at_starts_clock_at_load() {
+        // Entries persisted before the created_at field existed must not be
+        // treated as instantly expired on upgrade: the serde default stamps
+        // them with "now" so their TTL clock starts at load time.
+        let entry: ChallengeEntry =
+            serde_json::from_str(r#"{"value":"tok","client":"client_a"}"#).unwrap();
+        let now = unix_now();
+        assert!(
+            now - entry.created_at < 60,
+            "created_at should default to ~now"
+        );
+    }
+
+    #[tokio::test]
     async fn test_wildcard_domain_permission() {
         let mut clients = HashMap::new();
         clients.insert(
@@ -408,8 +655,15 @@ mod tests {
                 allowed_domains: vec!["*.example.com".to_string()],
             },
         );
-        let provider =
-            AcmeProvider::new(AcmeProviderConfig { clients }, None, Metrics::noop()).unwrap();
+        let provider = AcmeProvider::new(
+            AcmeProviderConfig {
+                clients,
+                challenge_ttl: "48h".to_string(),
+            },
+            None,
+            Metrics::noop(),
+        )
+        .unwrap();
 
         // Wildcard should match subdomains
         let result = provider

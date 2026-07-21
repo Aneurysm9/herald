@@ -186,6 +186,7 @@ All configuration keys with types, defaults, and environment variable overrides.
 | `providers.acme.zone` | string | (required if acme enabled) | — | Target zone for ACME challenges |
 | `providers.acme.domain` | string | (required if acme enabled) | — | Base domain for ACME challenges |
 | `providers.acme.clients` | map | — | — | Client configurations with allowed_domains |
+| `providers.acme.challenge_ttl` | string | `"48h"` | — | Challenges older than this are expired and cleaned up (humantime format) |
 | `providers.dynamic.clients` | map | — | — | Dynamic DNS client configs with allowed_domains and allowed_zones |
 | `reconciler.interval` | string | `"1m"` | `HERALD_RECONCILER_INTERVAL` | Reconciliation interval |
 | `reconciler.dry_run` | bool | `false` | `HERALD_RECONCILER_DRY_RUN` | Dry-run mode (log only, don't apply) |
@@ -384,6 +385,7 @@ All metrics use the `herald.*` namespace. 14 metrics are exported:
 | `herald.provider.errors` | Counter | `provider` | Number of provider errors |
 | `herald.acme.challenges.active` | UpDownCounter | — | Number of active ACME challenges |
 | `herald.acme.operations` | Counter | `operation`, `status` | ACME operations (`operation=set/clear`, `status=success/error`) |
+| `herald.acme.challenges.expired` | Counter | — | Challenges expired without being cleared by the client (indicates a client that crashed mid-renewal) |
 | `herald.dynamic.operations` | Counter | `operation`, `status` | Dynamic DNS operations (`operation=set/delete`, `status=success/error`) |
 | `herald.dynamic.records.active` | Gauge | — | Number of active dynamic DNS records |
 | `herald.backend.api_calls` | Counter | `operation`, `status` | Backend API calls (`operation=get_records/create/update/delete`, `status=success/error`) |
