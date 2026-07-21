@@ -1,4 +1,4 @@
-use super::{DesiredRecord, Named, Provider, RecordValue};
+use super::{DesiredRecord, Named, Provider, ProviderReport, RecordValue};
 use crate::config::AcmeProviderConfig;
 use crate::storage::SqliteStorage;
 use crate::telemetry::Metrics;
@@ -243,7 +243,7 @@ impl Named for AcmeProvider {
 }
 
 impl Provider for AcmeProvider {
-    fn records(&self) -> Pin<Box<dyn Future<Output = Result<Vec<DesiredRecord>>> + Send + '_>> {
+    fn records(&self) -> Pin<Box<dyn Future<Output = Result<ProviderReport>> + Send + '_>> {
         Box::pin(async move {
             let challenges = self.challenges.read().await;
             let records = challenges
@@ -254,7 +254,7 @@ impl Provider for AcmeProvider {
                     ttl: 60,
                 })
                 .collect();
-            Ok(records)
+            Ok(ProviderReport::ok(records))
         })
     }
 }
@@ -329,7 +329,7 @@ mod tests {
         assert!(result.is_ok());
 
         // Verify the challenge was actually removed
-        let records = provider.records().await.unwrap();
+        let records = provider.records().await.unwrap().records;
         assert!(records.is_empty());
     }
 
@@ -388,7 +388,7 @@ mod tests {
             .await
             .unwrap();
 
-        let records = provider.records().await.unwrap();
+        let records = provider.records().await.unwrap().records;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "_acme-challenge.alpha.example.com");
         assert_eq!(

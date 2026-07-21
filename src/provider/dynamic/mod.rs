@@ -1,4 +1,7 @@
-use super::{DesiredRecord, Named, Provider, RecordValue, check_domain_permission};
+use super::{
+    DesiredRecord, Named, Provider, ProviderIssue, ProviderReport, RecordValue,
+    check_domain_permission,
+};
 use crate::config::DynamicProviderConfig;
 use crate::storage::SqliteStorage;
 use crate::telemetry::Metrics;
@@ -361,31 +364,36 @@ impl Named for DynamicProvider {
 }
 
 impl Provider for DynamicProvider {
-    fn records(&self) -> Pin<Box<dyn Future<Output = Result<Vec<DesiredRecord>>> + Send + '_>> {
+    fn records(&self) -> Pin<Box<dyn Future<Output = Result<ProviderReport>> + Send + '_>> {
         Box::pin(async move {
             let records = self.records.read().await;
-            let result = records
-                .iter()
-                .filter_map(|(key, entry)| {
-                    match RecordValue::parse(&key.record_type, &entry.value) {
-                        Ok(value) => Some(DesiredRecord {
-                            name: key.name.clone(),
-                            value,
-                            ttl: entry.ttl,
-                        }),
-                        Err(e) => {
-                            tracing::error!(
-                                name = %key.name,
-                                record_type = %key.record_type,
-                                error = %e,
-                                "skipping invalid dynamic record"
-                            );
-                            None
-                        }
+            let mut result = Vec::new();
+            let mut issues = Vec::new();
+            for (key, entry) in records.iter() {
+                match RecordValue::parse(&key.record_type, &entry.value) {
+                    Ok(value) => result.push(DesiredRecord {
+                        name: key.name.clone(),
+                        value,
+                        ttl: entry.ttl,
+                    }),
+                    Err(e) => {
+                        tracing::error!(
+                            name = %key.name,
+                            record_type = %key.record_type,
+                            error = %e,
+                            "skipping invalid dynamic record"
+                        );
+                        issues.push(ProviderIssue::permanent(format!(
+                            "skipping invalid record {} {}: {e}",
+                            key.name, key.record_type
+                        )));
                     }
-                })
-                .collect();
-            Ok(result)
+                }
+            }
+            Ok(ProviderReport {
+                records: result,
+                issues,
+            })
         })
     }
 }
@@ -416,6 +424,46 @@ mod tests {
             },
         );
         DynamicProvider::new(DynamicProviderConfig { clients }, None, Metrics::noop()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn invalid_stored_record_becomes_permanent_issue() {
+        let provider = test_provider();
+        // A valid record.
+        provider
+            .set_record(
+                "opnsense",
+                "example.com",
+                "good.example.com",
+                "A",
+                "203.0.113.5",
+                60,
+            )
+            .await
+            .unwrap();
+        // An A record whose value is not a valid IP. set_record does not
+        // validate the value, so it is stored; records() will fail to parse it.
+        provider
+            .set_record(
+                "opnsense",
+                "example.com",
+                "bad.example.com",
+                "A",
+                "not-an-ip",
+                60,
+            )
+            .await
+            .unwrap();
+
+        let report = provider.records().await.unwrap();
+
+        // The valid record is still present...
+        assert!(report.records.iter().any(|r| r.name == "good.example.com"));
+        // ...and the bad one produced a permanent issue → incomplete report.
+        assert!(!report.is_complete());
+        assert_eq!(report.issues.len(), 1);
+        assert_eq!(report.issues[0].kind, crate::provider::IssueKind::Permanent);
+        assert!(report.issues[0].message.contains("skipping invalid record"));
     }
 
     #[tokio::test]
@@ -515,7 +563,7 @@ mod tests {
             .await;
         assert!(result.is_ok());
 
-        let records = provider.records().await.unwrap();
+        let records = provider.records().await.unwrap().records;
         assert!(records.is_empty());
     }
 
@@ -590,7 +638,7 @@ mod tests {
             .await
             .unwrap();
 
-        let records = provider.records().await.unwrap();
+        let records = provider.records().await.unwrap().records;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "wan.example.com");
         assert_eq!(
@@ -627,7 +675,7 @@ mod tests {
             .await
             .unwrap();
 
-        let records = provider.records().await.unwrap();
+        let records = provider.records().await.unwrap().records;
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].value,

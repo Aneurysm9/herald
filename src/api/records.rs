@@ -39,9 +39,17 @@ pub(super) async fn get_records(
 
     for provider in &state.providers {
         match provider.records().await {
-            Ok(records) => {
+            Ok(report) => {
                 let provider_name = provider.name().to_string();
-                all_records.extend(records.into_iter().map(|record| ProviderRecord {
+                for issue in &report.issues {
+                    tracing::warn!(
+                        provider = %provider_name,
+                        issue = %issue.message,
+                        "provider reported an issue"
+                    );
+                    warnings.push(format!("provider '{provider_name}': {}", issue.message));
+                }
+                all_records.extend(report.records.into_iter().map(|record| ProviderRecord {
                     provider: provider_name.clone(),
                     record,
                 }));
@@ -191,5 +199,86 @@ mod tests {
         let warnings = body["warnings"].as_array().unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].as_str().unwrap().contains("failing"));
+    }
+
+    struct PartialApiProvider;
+
+    impl crate::provider::Named for PartialApiProvider {
+        fn name(&self) -> &str {
+            "partial"
+        }
+    }
+
+    impl Provider for PartialApiProvider {
+        fn records(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = anyhow::Result<crate::provider::ProviderReport>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async move {
+                Ok(crate::provider::ProviderReport {
+                    records: vec![DesiredRecord {
+                        name: "kept.example.com".to_string(),
+                        value: RecordValue::parse("A", "203.0.113.7").unwrap(),
+                        ttl: 300,
+                    }],
+                    issues: vec![crate::provider::ProviderIssue::permanent(
+                        "skipping invalid record bad.example.com A: not an IP",
+                    )],
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_records_partial_includes_records_and_warnings() {
+        let providers: Vec<Arc<dyn Provider>> = vec![Arc::new(PartialApiProvider)];
+
+        let state = Arc::new(AppState {
+            acme_provider: None,
+            dynamic_provider: None,
+            token_index: test_token_index(),
+            providers,
+            reconciler: Arc::new(Reconciler::new(false, Metrics::noop())),
+            backends: vec![Arc::new(crate::api::tests::StubBackend {
+                existing: vec![],
+            })],
+            reconcile_notify: Arc::new(Notify::new()),
+            metrics: Metrics::noop(),
+            rate_limiter: None,
+        });
+
+        let server = TestServer::new(router(state).into_make_service()).unwrap();
+
+        let response = server
+            .get("/api/v1/records")
+            .add_header(
+                axum::http::header::AUTHORIZATION,
+                axum::http::HeaderValue::from_static("Bearer test-token-123"),
+            )
+            .await;
+        response.assert_status_ok();
+        let body: serde_json::Value = response.json();
+
+        // The valid record is present despite the issue.
+        let names: Vec<&str> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"kept.example.com"));
+
+        // The issue message is surfaced as a warning.
+        let warnings = body["warnings"].as_array().unwrap();
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.as_str().unwrap().contains("skipping invalid record"))
+        );
     }
 }

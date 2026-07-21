@@ -75,6 +75,7 @@ herald
 
 - **Provider pattern**: Each provider implements the `Provider` trait and contributes `Vec<DnsRecord>` to a unified desired-state set. Providers are independent and composable.
 - **Reconciliation, not imperative**: The reconciler diffs desired vs actual and converges. Safe to re-run. Supports dry-run mode.
+- **Delete-guard on incomplete state**: Providers return a `ProviderReport` (records + issues). If any provider errors or reports issues, the desired state is considered incomplete and the reconciler suppresses all deletions for that cycle (creates/updates still apply). This prevents a failing provider from cascading into record deletions. Suppressions are counted via the `herald.reconciliation.deletions_suppressed` metric.
 - **ACME is just a provider**: Challenge TXT records are ephemeral entries in the desired state, added/removed via API. They participate in the same reconciliation loop as all other records.
 - **Zone-agnostic providers**: Providers declare records by FQDN only. The reconciler derives the zone from the FQDN using backend zone declarations via longest suffix matching. This decouples providers from backend topology.
 - **Multi-backend support**: Multiple backends can be configured, each managing a distinct set of zones. Zones cannot overlap between backends.
@@ -376,12 +377,15 @@ Response:
 }
 ```
 
-When a provider fails, its records are omitted and a `warnings` array is included:
+When a provider fails, its records are omitted and a `warnings` array is included. A provider can also report *partially*: records it produced are returned and each issue it hit (e.g., an unparseable stored record) becomes a warning:
 
 ```json
 {
   "records": [...],
-  "warnings": ["provider 'static' failed: I/O error"]
+  "warnings": [
+    "provider 'static' failed: I/O error",
+    "provider 'dynamic': skipping invalid record bad.example.com A: invalid IP"
+  ]
 }
 ```
 

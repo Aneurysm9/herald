@@ -55,6 +55,9 @@ pub(crate) struct Metrics {
     // Reconciliation drift
     pub reconciliation_drift: Gauge<u64>,
 
+    // Delete-guard
+    pub deletions_suppressed: Counter<u64>,
+
     // Rate limiting
     pub rate_limit_rejected: Counter<u64>,
 }
@@ -169,6 +172,10 @@ impl Metrics {
             reconciliation_drift: meter
                 .u64_gauge("herald.reconciliation.drift")
                 .with_description("Number of changes needed to converge (0 = converged)")
+                .build(),
+            deletions_suppressed: meter
+                .u64_counter("herald.reconciliation.deletions_suppressed")
+                .with_description("Deletions skipped because desired state was incomplete")
                 .build(),
             rate_limit_rejected: meter
                 .u64_counter("herald.rate_limit.rejected")
