@@ -15,6 +15,14 @@ pub(crate) struct Reconciler {
     metrics: Metrics,
 }
 
+/// Outcome of collecting desired records: the merged records and whether every
+/// provider reported its full desired state. `complete == false` triggers the
+/// reconciler's delete-guard.
+struct DesiredCollection {
+    records: Vec<DesiredRecord>,
+    complete: bool,
+}
+
 impl Reconciler {
     /// Creates a new reconciler with the given settings.
     ///
@@ -61,16 +69,44 @@ impl Reconciler {
         }
 
         // 1. Collect desired records from all providers
-        let desired_raw = self.collect_desired_records(providers).await;
+        let collected = self.collect_desired_records(providers).await;
 
         // 2. Enrich records with derived zones
-        let desired = Self::enrich_zones(desired_raw, backends)?;
+        let desired = Self::enrich_zones(collected.records, backends)?;
 
         // 3. Get existing records from all backends
         let all_existing = self.collect_existing_records(backends).await;
 
         // 4. Diff to compute changes
-        let changes = Self::diff(&desired, &all_existing);
+        let mut changes = Self::diff(&desired, &all_existing);
+
+        // 4a. Safety guard: if any provider failed to report its full desired
+        // state, suppress deletions this cycle. A record missing from an
+        // incomplete desired set may simply reflect a provider error rather than
+        // genuine deletion intent; deleting it would be destructive. Creates and
+        // updates still proceed. Deletions resume once all providers are healthy.
+        if !collected.complete {
+            let before = changes.len();
+            let mut suppressed = 0_u64;
+            changes.retain(|change| {
+                if matches!(change, Change::Delete(_)) {
+                    tracing::warn!(%change, "suppressing deletion (desired state incomplete)");
+                    suppressed += 1;
+                    false
+                } else {
+                    true
+                }
+            });
+            if suppressed > 0 {
+                self.metrics.deletions_suppressed.add(suppressed, &[]);
+                tracing::warn!(
+                    suppressed,
+                    remaining = changes.len(),
+                    original = before,
+                    "delete-guard active: desired state incomplete"
+                );
+            }
+        }
 
         self.metrics
             .reconciliation_drift
@@ -109,8 +145,9 @@ impl Reconciler {
     /// Collect desired records from all providers.
     ///
     /// Continues on provider errors to ensure one failing provider doesn't block others.
-    async fn collect_desired_records(&self, providers: &[Arc<dyn Provider>]) -> Vec<DesiredRecord> {
+    async fn collect_desired_records(&self, providers: &[Arc<dyn Provider>]) -> DesiredCollection {
         let mut desired = Vec::new();
+        let mut complete = true;
         for provider in providers {
             match provider.records().await {
                 Ok(report) => {
@@ -123,27 +160,47 @@ impl Reconciler {
                         report.records.len() as u64,
                         &[KeyValue::new("provider", provider.name().to_string())],
                     );
+                    if !report.is_complete() {
+                        complete = false;
+                    }
                     for issue in &report.issues {
+                        let kind = match issue.kind {
+                            crate::provider::IssueKind::Transient => "transient",
+                            crate::provider::IssueKind::Permanent => "permanent",
+                        };
                         tracing::warn!(
                             provider = provider.name(),
+                            kind,
                             issue = %issue.message,
                             "provider reported an issue"
                         );
-                        self.metrics
-                            .provider_errors
-                            .add(1, &[KeyValue::new("provider", provider.name().to_string())]);
+                        self.metrics.provider_errors.add(
+                            1,
+                            &[
+                                KeyValue::new("provider", provider.name().to_string()),
+                                KeyValue::new("kind", kind),
+                            ],
+                        );
                     }
                     desired.extend(report.records);
                 }
                 Err(e) => {
+                    complete = false;
                     tracing::error!(provider = provider.name(), error = %e, "failed to collect records");
-                    self.metrics
-                        .provider_errors
-                        .add(1, &[KeyValue::new("provider", provider.name().to_string())]);
+                    self.metrics.provider_errors.add(
+                        1,
+                        &[
+                            KeyValue::new("provider", provider.name().to_string()),
+                            KeyValue::new("kind", "transient"),
+                        ],
+                    );
                 }
             }
         }
-        desired
+        DesiredCollection {
+            records: desired,
+            complete,
+        }
     }
 
     /// Enrich records with derived zones.
@@ -459,6 +516,29 @@ mod tests {
                     anyhow::bail!("stub provider error");
                 }
                 Ok(ProviderReport::ok(desired))
+            })
+        }
+    }
+
+    struct PartialProvider {
+        label: &'static str,
+        desired: Vec<DesiredRecord>,
+    }
+
+    impl Named for PartialProvider {
+        fn name(&self) -> &str {
+            self.label
+        }
+    }
+
+    impl Provider for PartialProvider {
+        fn records(&self) -> Pin<Box<dyn Future<Output = Result<ProviderReport>> + Send + '_>> {
+            let desired = self.desired.clone();
+            Box::pin(async move {
+                Ok(ProviderReport {
+                    records: desired,
+                    issues: vec![crate::provider::ProviderIssue::transient("partial fetch")],
+                })
             })
         }
     }
@@ -1014,5 +1094,68 @@ mod tests {
         // 1 update (rec3 → 4.4.4.4) + 1 create (5.5.5.5) + 0 delete = 2 changes
         // Note: rec3 gets updated to accommodate one of the new values
         assert_eq!(*apply_count.lock().unwrap(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_provider_suppresses_deletes() {
+        let reconciler = Reconciler::new(false, Metrics::noop());
+        // Provider returns NO records but is incomplete (issue present).
+        let provider: Arc<dyn Provider> = Arc::new(PartialProvider {
+            label: "partial",
+            desired: vec![],
+        });
+        // A managed record exists at the backend that would otherwise be deleted.
+        let (backend, apply_count) = StubBackend::new(
+            vec!["example.com".to_string()],
+            vec![managed("rec1", "old.example.com", "A", "1.1.1.1")],
+        );
+
+        let backends: &[Arc<dyn Backend>] = &[Arc::new(backend) as Arc<dyn Backend>];
+        reconciler.reconcile(&[provider], backends).await.unwrap();
+
+        // Delete suppressed because desired state was incomplete.
+        assert_eq!(*apply_count.lock().unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_incomplete_provider_still_applies_creates() {
+        let reconciler = Reconciler::new(false, Metrics::noop());
+        // Incomplete provider that DOES contribute a record needing creation.
+        let provider: Arc<dyn Provider> = Arc::new(PartialProvider {
+            label: "partial",
+            desired: vec![desired("new.example.com", "A", "1.2.3.4")],
+        });
+        // Backend also has a stale managed record that would be deleted.
+        let (backend, apply_count) = StubBackend::new(
+            vec!["example.com".to_string()],
+            vec![managed("rec1", "old.example.com", "A", "1.1.1.1")],
+        );
+
+        let backends: &[Arc<dyn Backend>] = &[Arc::new(backend) as Arc<dyn Backend>];
+        reconciler.reconcile(&[provider], backends).await.unwrap();
+
+        // Create applied (1), delete suppressed -> exactly 1 change applied.
+        assert_eq!(*apply_count.lock().unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_err_provider_suppresses_deletes() {
+        let reconciler = Reconciler::new(false, Metrics::noop());
+        // A provider that errors entirely makes the cycle incomplete.
+        let failing: Arc<dyn Provider> = Arc::new(StubProvider {
+            label: "failing",
+            desired: vec![],
+            fail: true,
+        });
+        let (backend, apply_count) = StubBackend::new(
+            vec!["example.com".to_string()],
+            vec![managed("rec1", "old.example.com", "A", "1.1.1.1")],
+        );
+
+        let backends: &[Arc<dyn Backend>] = &[Arc::new(backend) as Arc<dyn Backend>];
+        reconciler.reconcile(&[failing], backends).await.unwrap();
+
+        // Delete suppressed because a provider failed.
+        assert_eq!(*apply_count.lock().unwrap(), 0);
     }
 }
