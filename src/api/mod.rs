@@ -15,7 +15,7 @@ use axum::{
     middleware,
     routing::{get, post},
 };
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use opentelemetry::KeyValue;
 use sha2::Sha256;
 use std::collections::HashMap;
