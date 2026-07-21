@@ -38,6 +38,18 @@ The Nix dev shell provides:
 - **cargo-watch** — automatic recompilation on file changes
 - **alejandra** — Nix code formatter
 
+## Minimum Supported Rust Version (MSRV)
+
+Herald is a deployed binary, not a published library: its MSRV is a statement about the environments that build it (the Nix dev shell and CI), not a compatibility contract with downstream crates. The policy is therefore deliberately liberal:
+
+1. **Single source of truth.** The ceiling is the toolchain provided by the Nix flake (`rust-bin.stable.latest` as pinned by `flake.lock`); `rust-version` in `Cargo.toml` declares the MSRV and must never exceed the flake's toolchain. The CI `msrv` test job derives its toolchain from `rust-version`, so a bump touches `Cargo.toml` only (plus a `nix flake update` first if the flake toolchain has fallen behind the desired floor).
+2. **Tracking target.** Stay within roughly two stable releases (~3 months) of current Rust. Close enough that dependency updates are never blocked for long; enough lag that a brand-new release with a regression is never the floor.
+3. **When to bump.** In order of legitimacy: a security-relevant dependency update requires it (never hold those back for MSRV); a routine dependency update requires it and the new floor satisfies rule 2; or the flake toolchain moved and the declarations are being re-synced. Do not bump speculatively for language features not yet in use.
+4. **How to bump.** One dedicated commit (`chore!:` so it is prominent in the changelog) updating `rust-version`, verified by the CI `msrv` job actually building on the new floor.
+5. **Escape clause.** If Herald ever gains library consumers (published crate, workspace dependents), this policy must be replaced with a conservative time-based one (e.g., Tokio's "MSRV is at least six months old").
+
+Because `Cargo.toml` uses edition 2024, Cargo's resolver is MSRV-aware: `cargo update` will prefer dependency versions compatible with `rust-version`. Note that Dependabot's major-version bump PRs are *not* MSRV-aware — a dependency PR failing only the `msrv` CI job is the signal that it needs an MSRV decision, not a code fix.
+
 ## Code Style
 
 Herald enforces strict code quality standards via `clippy::pedantic` and rustfmt.

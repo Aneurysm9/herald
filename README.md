@@ -195,6 +195,8 @@ nix build .#heraldStatic
 nix build
 ```
 
+Building outside the Nix dev shell requires Rust ≥ the `rust-version` in `Cargo.toml` (currently 1.95). See [CONTRIBUTING.md](CONTRIBUTING.md#minimum-supported-rust-version-msrv) for the MSRV policy.
+
 ## Testing
 
 ```bash
