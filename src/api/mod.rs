@@ -306,7 +306,7 @@ pub(crate) mod tests {
         });
 
         let app = router(state);
-        TestServer::new(app.into_make_service()).unwrap()
+        TestServer::new(app.into_make_service())
     }
 
     pub(crate) fn test_dynamic_state() -> Arc<AppState> {

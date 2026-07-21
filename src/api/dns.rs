@@ -110,7 +110,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_dns_record_success() {
         let state = test_dynamic_state();
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let response = server
             .post("/api/v1/dns/record")
@@ -133,7 +133,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_dns_record_no_auth() {
         let state = test_dynamic_state();
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let response = server
             .post("/api/v1/dns/record")
@@ -154,7 +154,7 @@ mod tests {
     #[tokio::test]
     async fn test_set_dns_record_forbidden() {
         let state = test_dynamic_state();
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let response = server
             .post("/api/v1/dns/record")
@@ -185,7 +185,7 @@ mod tests {
     #[tokio::test]
     async fn test_delete_dns_record_success() {
         let state = test_dynamic_state();
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         // First set a record
         server
@@ -235,7 +235,7 @@ mod tests {
             rate_limiter: None,
         });
 
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let response = server
             .post("/api/v1/dns/record")

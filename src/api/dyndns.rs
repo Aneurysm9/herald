@@ -122,7 +122,7 @@ mod tests {
     #[tokio::test]
     async fn test_dyndns_update_success() {
         let state = test_dynamic_state();
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         // Encode credentials as Basic Auth
         let credentials = base64::Engine::encode(
@@ -147,7 +147,7 @@ mod tests {
     #[tokio::test]
     async fn test_dyndns_update_badauth() {
         let state = test_dynamic_state();
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         // Invalid credentials
         let credentials =
@@ -169,7 +169,7 @@ mod tests {
     #[tokio::test]
     async fn test_dyndns_update_noauth() {
         let state = test_dynamic_state();
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let response = server
             .get("/nic/update?hostname=test.example.com&myip=203.0.113.1")
@@ -183,7 +183,7 @@ mod tests {
     #[tokio::test]
     async fn test_dyndns_update_nohost() {
         let state = test_dynamic_state();
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let credentials = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
@@ -207,7 +207,7 @@ mod tests {
     #[tokio::test]
     async fn test_dyndns_update_ipv6() {
         let state = test_dynamic_state();
-        let server = TestServer::new(router(state).into_make_service()).unwrap();
+        let server = TestServer::new(router(state).into_make_service());
 
         let credentials = base64::Engine::encode(
             &base64::engine::general_purpose::STANDARD,
