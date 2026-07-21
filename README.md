@@ -3,7 +3,7 @@
 [![CI](https://github.com/Aneurysm9/herald/actions/workflows/ci.yml/badge.svg)](https://github.com/Aneurysm9/herald/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/Aneurysm9/herald)](https://github.com/Aneurysm9/herald/releases/latest)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![MSRV](https://img.shields.io/badge/MSRV-1.88-orange.svg)](Cargo.toml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.95-orange.svg)](Cargo.toml)
 
 **DNS control plane for multi-provider record management**
 
