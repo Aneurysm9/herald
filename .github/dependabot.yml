@@ -14,6 +14,18 @@ updates:
       hickory:
         patterns:
           - "hickory-*"
+      # RustCrypto crates interoperate through the shared `digest` traits and
+      # must move between digest generations together (sha2 0.11 + hmac 0.13).
+      rustcrypto:
+        patterns:
+          - "digest"
+          - "hmac"
+          - "sha1"
+          - "sha2"
+          - "sha3"
+          - "crypto-common"
+          - "block-buffer"
+          - "subtle"
       # Everything else: batch routine minor/patch bumps into one PR.
       cargo-minor-patch:
         update-types:
@@ -29,3 +41,14 @@ updates:
         applies-to: security-updates
         patterns:
           - "hickory-*"
+      rustcrypto-security:
+        applies-to: security-updates
+        patterns:
+          - "digest"
+          - "hmac"
+          - "sha1"
+          - "sha2"
+          - "sha3"
+          - "crypto-common"
+          - "block-buffer"
+          - "subtle"
