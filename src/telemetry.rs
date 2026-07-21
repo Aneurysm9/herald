@@ -35,6 +35,7 @@ pub(crate) struct Metrics {
     // ACME
     pub acme_challenges_active: UpDownCounter<i64>,
     pub acme_operations: Counter<u64>,
+    pub acme_challenges_expired: Counter<u64>,
 
     // Dynamic DNS
     pub dynamic_operations: Counter<u64>,
@@ -133,6 +134,10 @@ impl Metrics {
             acme_operations: meter
                 .u64_counter("herald.acme.operations")
                 .with_description("Number of ACME operations")
+                .build(),
+            acme_challenges_expired: meter
+                .u64_counter("herald.acme.challenges.expired")
+                .with_description("Challenges expired without being cleared by the client")
                 .build(),
             dynamic_operations: meter
                 .u64_counter("herald.dynamic.operations")

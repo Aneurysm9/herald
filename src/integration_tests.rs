@@ -133,6 +133,7 @@ async fn test_acme_challenge_lifecycle() {
                         rate_limit: None,
                     },
                 )]),
+                challenge_ttl: "48h".to_string(),
             },
             None, // no persistence
             Metrics::noop(),

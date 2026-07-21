@@ -224,6 +224,17 @@ pub(crate) struct AcmeProviderConfig {
     /// Per-client token configuration
     #[serde(default)]
     pub clients: HashMap<String, AcmeClientConfig>,
+
+    /// How long a challenge may live before it is expired and cleaned up.
+    ///
+    /// Guards against ACME clients that crash mid-renewal and never clear
+    /// their challenge. Humantime format (e.g., "48h", "30m").
+    #[serde(default = "default_challenge_ttl")]
+    pub challenge_ttl: String,
+}
+
+fn default_challenge_ttl() -> String {
+    "48h".to_string()
 }
 
 /// Per-client ACME configuration.
@@ -713,6 +724,35 @@ mod tests {
     #[test]
     fn test_default_reconciler_interval() {
         assert_eq!(default_reconciler_interval(), "1m");
+    }
+
+    #[test]
+    fn test_default_challenge_ttl_is_48h() {
+        assert_eq!(default_challenge_ttl(), "48h");
+    }
+
+    #[test]
+    fn test_acme_challenge_ttl_from_yaml() {
+        let config = parse_yaml(
+            "tls:\n  cert_file: /c\n  key_file: /k\n\
+             providers:\n  acme:\n    challenge_ttl: \"30m\"\n    clients:\n\
+             \x20\x20\x20\x20\x20\x20web:\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20allowed_domains: [\"example.com\"]\n",
+        );
+        let acme = config.providers.acme.unwrap();
+        assert_eq!(acme.challenge_ttl, "30m");
+    }
+
+    #[test]
+    fn test_acme_challenge_ttl_defaults_when_omitted() {
+        let config = parse_yaml(
+            "tls:\n  cert_file: /c\n  key_file: /k\n\
+             providers:\n  acme:\n    clients:\n\
+             \x20\x20\x20\x20\x20\x20web:\n\
+             \x20\x20\x20\x20\x20\x20\x20\x20allowed_domains: [\"example.com\"]\n",
+        );
+        let acme = config.providers.acme.unwrap();
+        assert_eq!(acme.challenge_ttl, "48h");
     }
 
     #[test]

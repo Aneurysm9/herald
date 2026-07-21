@@ -283,6 +283,7 @@ pub(crate) mod tests {
             AcmeProvider::new(
                 AcmeProviderConfig {
                     clients: acme_clients,
+                    challenge_ttl: "48h".to_string(),
                 },
                 None,
                 Metrics::noop(),
