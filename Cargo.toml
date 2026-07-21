@@ -70,7 +70,7 @@ humantime = "2"
 clap = { version = "4", features = ["derive"] }
 
 # Database (for dynamic DNS and ACME persistence)
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # OpenTelemetry
 opentelemetry = "0.32"
