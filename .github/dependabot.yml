@@ -1,0 +1,31 @@
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      # Crates that release in lockstep and share traits across crate
+      # boundaries must be bumped together, or the dependency graph splits
+      # into two incompatible versions of the same crate.
+      opentelemetry:
+        patterns:
+          - "opentelemetry*"
+      hickory:
+        patterns:
+          - "hickory-*"
+      # Everything else: batch routine minor/patch bumps into one PR.
+      cargo-minor-patch:
+        update-types:
+          - "minor"
+          - "patch"
+      # Security updates get their own group definitions (applies-to
+      # defaults to version-updates only).
+      opentelemetry-security:
+        applies-to: security-updates
+        patterns:
+          - "opentelemetry*"
+      hickory-security:
+        applies-to: security-updates
+        patterns:
+          - "hickory-*"
